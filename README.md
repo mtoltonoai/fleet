@@ -53,6 +53,31 @@ use the charter's rest cadence and let board events wake the session. Event deli
 the fallback timer. A blocked task should record its dependency on the board; it does not justify
 leaving other actionable assignments idle.
 
+## Notifier health and release verification
+
+`GET /health` (also `/healthz` and `/`) returns a JSON liveness report with `service`, `status`, `check`,
+`version` and `build_revision`. The revision is the serving binary's baked `FLEET_BUILD_REV`, the same
+identifier reported by that binary's `fleet version`. Packaged builds should supply the reviewed source
+revision or source fingerprint; `unknown` or a dirty revision requires checking the build inputs.
+The response uses `Cache-Control: no-store` so a probe can identify the current serving build.
+
+A health response proves the notifier can answer HTTP. Verify wake delivery separately: an actionable
+webhook receives 200 only after session-host acceptance, 503 on delivery failure, and 400 for malformed
+input. Session acceptance itself is separate from completing a turn or accepting a task. Local socket
+tests exercise these distinctions without a model call:
+
+```sh
+cargo test -p fleet notify::tests
+```
+
+For a release, record implementation and test results, reviewed commit IDs, integration ref, deployed
+build identifier and observed live behavior separately. Before an approved deployment, capture the
+current service executable and rollback target. After deployment, compare the health `build_revision`
+with the approved build and its `fleet version` output. Observe an approved ordinary task's wake through
+the board, notifier and session outcome before claiming end-to-end delivery. A heartbeat or health 200
+alone is insufficient. If validation fails, the service owner should restore the captured release through
+the approved deployment workflow and repeat the checks.
+
 ## Local development and validation
 
 Start from a clean worktree or identify existing changes with `git status --short`. Keep changes within

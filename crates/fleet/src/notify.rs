@@ -397,6 +397,27 @@ async fn respond(stream: &mut TcpStream, status: &str) {
     .await;
 }
 
+/// Report the serving binary's identity without probing or waking a session.
+async fn respond_health(stream: &mut TcpStream) {
+    let body = serde_json::json!({
+        "service": "fleet-notify",
+        "status": "ok",
+        "check": "liveness",
+        "version": env!("CARGO_PKG_VERSION"),
+        "build_revision": env!("FLEET_BUILD_REV"),
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+    );
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.write_all(response.as_bytes()),
+    )
+    .await;
+}
+
 async fn handle_connection(stream: TcpStream, hub_root: Arc<std::path::Path>) {
     handle_connection_at(
         stream,
@@ -426,7 +447,7 @@ async fn handle_connection_at(
             }
         };
     if classify_request(&method, &path) == Incoming::HealthProbe {
-        respond(&mut stream, "200 OK").await;
+        respond_health(&mut stream).await;
         return;
     }
     let event: Value = match serde_json::from_str(&body) {
@@ -515,6 +536,75 @@ async fn serve_async(port: u16, session: &str, hub_root: &std::path::Path) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn request_without_host(request: &str) -> String {
+        let root = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let path = root.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            handle_connection_at(
+                server,
+                Arc::from(path.as_path()),
+                path.clone(),
+                false,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        });
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        task.await.unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        response
+    }
+
+    #[tokio::test]
+    async fn health_reports_build_and_liveness_scope_without_a_session() {
+        for path in ["/health", "/healthz", "/", "/health?probe=version"] {
+            let response = request_without_host(&format!("GET {path} HTTP/1.1\r\n\r\n")).await;
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(headers.starts_with("HTTP/1.1 200 OK"));
+            assert!(headers.contains("Content-Type: application/json\r\n"));
+            assert!(headers.contains("Cache-Control: no-store\r\n"));
+            assert_eq!(parse_content_length(headers), body.len());
+            assert_eq!(
+                serde_json::from_str::<Value>(body).unwrap(),
+                serde_json::json!({
+                    "service": "fleet-notify",
+                    "status": "ok",
+                    "check": "liveness",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "build_revision": env!("FLEET_BUILD_REV"),
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_notifier_still_rejects_undeliverable_or_malformed_wakes() {
+        let event = r#"{"recipient":"missing","type":"task.assigned","task_id":5}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{event}",
+            event.len()
+        );
+        let response = request_without_host(&request).await;
+        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_eq!(response.split_once("\r\n\r\n").unwrap().1, "");
+        let response =
+            request_without_host("POST /health HTTP/1.1\r\nContent-Length: 1\r\n\r\n{").await;
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+    }
 
     #[test]
     fn board_event_identity_survives_duplicate_delivery_and_interrupt() {
