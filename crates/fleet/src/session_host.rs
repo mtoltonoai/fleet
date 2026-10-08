@@ -58,6 +58,7 @@ fn cadence(input: &str) -> Result<Duration, String> {
         Some(b's') => (&input[..input.len() - 1], 1u64),
         Some(b'm') => (&input[..input.len() - 1], 60),
         Some(b'h') => (&input[..input.len() - 1], 3600),
+        Some(b'd') => (&input[..input.len() - 1], 86400),
         _ => (input, 1),
     };
     let seconds = digits
@@ -65,7 +66,9 @@ fn cadence(input: &str) -> Result<Duration, String> {
         .ok()
         .and_then(|n| n.checked_mul(factor))
         .filter(|n| *n > 0 && *n <= 86400)
-        .ok_or_else(|| "interval must be a positive duration up to 24h (Ns, Nm, Nh)".to_string())?;
+        .ok_or_else(|| {
+            "interval must be a positive duration up to 24h (Ns, Nm, Nh, Nd)".to_string()
+        })?;
     Ok(Duration::from_secs(seconds))
 }
 
@@ -729,7 +732,7 @@ mod tests {
     #[test]
     fn validates_interval_and_control() {
         assert_eq!(cadence("2m").unwrap(), Duration::from_secs(120));
-        for invalid in ["0", "0s", "-1m", "99999999999999999h", "1d", ""] {
+        for invalid in ["0", "0s", "-1m", "99999999999999999h", "2d", ""] {
             assert!(cadence(invalid).is_err());
         }
         assert!(matches!(
@@ -748,6 +751,41 @@ mod tests {
             assert!(parse_control(invalid.as_bytes()).is_err());
         }
         assert!(!safe_agent("../escape"));
+    }
+
+    #[test]
+    fn daily_cadence_matches_watchdog_and_board_policy() {
+        let daily = Duration::from_secs(86400);
+        for input in ["1d", " 1d ", "24h", "1440m", "86400s", "86400"] {
+            assert_eq!(cadence(input).unwrap(), daily, "{input}");
+            assert_eq!(crate::parse_interval_secs(input), Some(daily.as_secs()));
+            assert_eq!(
+                cadence_or_default(input),
+                daily,
+                "startup interval: {input}"
+            );
+            let record = json!({"lifecycle_intent":"run","metadata":{"interval":input}});
+            assert_eq!(board_policy(&record).unwrap(), (false, Some(daily)));
+        }
+    }
+
+    #[test]
+    fn cadence_preserves_duration_bounds() {
+        for input in ["1", "1s", "1m", "1h", "1d"] {
+            assert!(cadence(input).is_ok(), "{input}");
+        }
+        for input in [
+            "0d",
+            "2d",
+            "25h",
+            "1441m",
+            "86401s",
+            "86401",
+            "18446744073709551615d",
+        ] {
+            assert!(cadence(input).is_err(), "{input}");
+            assert_eq!(cadence_or_default(input), Duration::from_secs(1800));
+        }
     }
 
     #[test]
