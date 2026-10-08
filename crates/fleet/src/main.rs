@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 mod board;
+mod codex;
 mod concierge_mint;
 mod config;
 mod dream;
@@ -25,8 +26,21 @@ mod memory;
 mod notify;
 mod prose_lint;
 mod scan;
+mod session_host;
 mod transcripts;
 mod workspace;
+
+/// Stable local execution state, independent of an agent worktree's cwd.
+fn codex_state_root() -> PathBuf {
+    config::get()
+        .root
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".fleet")
+        })
+        .join("sessions")
+}
 
 /// The tmux session board-native agents run in (their windows are opened here by `launch_board_agent`, and
 /// the notifier injects wakes here). From `config.session`, else `main`.
@@ -658,7 +672,7 @@ fn default_interval() -> String {
     "10m".to_string()
 }
 fn default_model() -> String {
-    "opus".to_string()
+    "default".to_string()
 }
 
 /// One declared agent in a target repo's checked-in `fleet.toml` roster — the DESIRED persistent set
@@ -712,19 +726,33 @@ struct TargetConfig {
     agents: Vec<RosterEntry>,
 }
 
-/// Resolve a model alias to the full id `claude --model` receives (the fleet runs the 1M-context
-/// variants). The ONE place the long ids live, so registry/CLI stay readable. Unknown → passthrough.
-fn resolve_model(alias: &str) -> String {
-    match alias {
-        "opus" => "us.anthropic.claude-opus-5-5[1m]".to_string(),
-        "fable" => "us.anthropic.claude-fable-5[1m]".to_string(),
-        "sonnet" => "us.anthropic.claude-sonnet-5".to_string(),
-        // Self-heal a stale/mis-registered id: the bare Anthropic-API sonnet id (`claude-sonnet-5-5`) is
-        // rejected by this fleet's Bedrock endpoint (400 "invalid model identifier"), so an agent registered
-        // with it 400s every turn and never ticks (the board-triage / board-follow-up outage). Map the bad
-        // literal to the valid Bedrock id so a launch survives the misregistration instead of dying silently.
-        "claude-sonnet-5-5" | "sonnet-5-5" => "us.anthropic.claude-sonnet-5".to_string(),
-        other => other.to_string(),
+/// Preserve catalog model IDs and use Astra for unspecified or legacy model names.
+fn resolve_model(model: &str) -> String {
+    const FALLBACK: &str = "gpt-6-astra";
+    // Preserve recognized Codex IDs; legacy aliases and unspecified models use Astra.
+    let cached = std::env::var_os("HOME")
+        .and_then(|home| std::fs::read(PathBuf::from(home).join(".codex/models_cache.json")).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let catalog = cached
+        .as_ref()
+        .and_then(|value| value.get("models"))
+        .and_then(|value| value.as_array());
+    let known = catalog
+        .map(|models| {
+            models
+                .iter()
+                .any(|entry| entry.get("slug").and_then(|v| v.as_str()) == Some(model))
+        })
+        .unwrap_or_else(|| {
+            model.starts_with("gpt-") || model.starts_with("codex-") || model == "astra-persistent"
+        });
+    if known {
+        model.to_string()
+    } else {
+        if model != "default" && !model.is_empty() {
+            eprintln!("fleet: model {model:?} is not in the Codex catalog; using {FALLBACK}");
+        }
+        FALLBACK.to_string()
     }
 }
 
@@ -3309,8 +3337,26 @@ enum Cmd {
         interval: String,
     },
     /// Run the event-driven wake notifier: a local HTTP endpoint that receives the board's per-agent
-    /// webhook POSTs and `tmux send-keys` injects `[notification] task #<id>` / `message #<seq>` into the
+    /// webhook POSTs and delivers managed Codex turns containing `[notification] task #<id>` / `message #<seq>` into the
     /// recipient agent's window (register this endpoint as each board-backed agent's `webhook_url`). Blocks.
+    CodexSession {
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "default")]
+        model: String,
+        #[arg(long, default_value = "high")]
+        effort: String,
+        #[arg(long, default_value = "30m")]
+        interval: String,
+        #[arg(long)]
+        once: bool,
+    },
+    /// Resume a paused managed session only after checking old processes have stopped.
+    ResumeSession {
+        agent: String,
+        #[arg(long, required = true)]
+        confirm_stopped: bool,
+    },
     Notify {
         /// Port to listen on (127.0.0.1 only).
         #[arg(long, default_value_t = 8899)]
@@ -3337,7 +3383,7 @@ enum Cmd {
         /// (Codex CLI rollout JSONL). Codex rollouts are dated files, not per-agent project dirs, so for
         /// `codex` pass the rollout file explicitly with `--session <path>` — agent auto-location is
         /// claude-only for now.
-        #[arg(long, default_value = "claude")]
+        #[arg(long, default_value = "codex")]
         harness: String,
     },
     /// Print the set of agents THIS host should serve on the reverse tunnel — the board agents that have a
@@ -4251,6 +4297,43 @@ fn main() {
         Cmd::ComposeMandates { agent, out, write } => compose_mandates(&fleet, &agent, &out, write),
         Cmd::ComposeMandatesSweep { out_dir, write } => {
             compose_mandates_sweep(&fleet, out_dir.as_deref(), write)
+        }
+        Cmd::CodexSession {
+            agent,
+            model,
+            effort,
+            interval,
+            once,
+        } => {
+            let kickoff = std::env::var("CDZ_KICKOFF").unwrap_or_default();
+            let model = Some(resolve_model(&model));
+            let board_native = std::env::var("FLEET_BOARD_NATIVE").as_deref() == Ok("1");
+            if let Err(error) = session_host::serve(
+                &agent,
+                codex_state_root(),
+                model,
+                Some(effort),
+                &interval,
+                kickoff,
+                board_native,
+                once,
+            ) {
+                eprintln!("fleet codex-session: {error}");
+                std::process::exit(1);
+            }
+        }
+        Cmd::ResumeSession {
+            agent,
+            confirm_stopped: _,
+        } => {
+            if let Err(error) = notify::session_control(
+                &codex_state_root(),
+                &agent,
+                serde_json::json!({"resume": true}),
+            ) {
+                eprintln!("fleet resume-session: {error}");
+                std::process::exit(1);
+            }
         }
         Cmd::Notify { port } => {
             if let Err(e) = notify::serve(port, &board_session(), &fleet.root) {
@@ -5334,11 +5417,11 @@ fn spin_up(agent: &str, apply: bool, ignore_intent: bool) {
         .and_then(|v| v.as_str())
         .map(|s| !s.is_empty())
         .unwrap_or(false);
-    let model = resolve_model(&field("model").unwrap_or_else(|| "opus".into()));
+    let model = resolve_model(&field("model").unwrap_or_else(|| "default".into()));
     let effort = field("effort").unwrap_or_else(|| "high".into());
     let interval = field("interval").unwrap_or_else(|| "30m".into());
     // The agent runtime to launch (metadata.harness); defaults to claude so existing records are unchanged.
-    let harness = field("harness").unwrap_or_else(|| "claude".into());
+    let harness = field("harness").unwrap_or_else(|| "codex".into());
     // Opt-in: launch inside the workdir's flake devShell so the pinned toolchain is on PATH (#214). Off by
     // default — set only for an agent whose workdir is a flake with a devShell.
     let devshell = md
@@ -5779,7 +5862,6 @@ fn build_kickoff(
     };
     // A >1h idle cadence cannot be held by the dynamic self-wake (it clamps to 1h) — append the cron-cadence
     // escalation so a long-rest monitor rests off a CronCreate cron instead of idle-polling hourly (task_765).
-    let tick = format!("{tick}{}", long_cadence_cron_clause(interval));
     format!(
         "You are the fleet agent '{agent}', running UNATTENDED. Your task-board MCP tools are available in \
          this session. Call register_agent with agent_id '{agent}' once (idempotent) so your board record \
@@ -5870,67 +5952,42 @@ fn build_kickoff(
          your first action this session you MUST get_document(doc_3330) and read it in full, then operate by \
          it. Each session check doc_3330's current approved version; if it changed since you last read it, \
          re-read it in full before acting. You work \
-         in {workdir}. Start your recurring \
-         loop now: /loop {tick}"
+         in {workdir}. Fleet schedules turns and delivers board wakes. Do not create a harness loop or cron. \
+         A completed turn is an attempt outcome, not task acceptance. Now {tick}"
     )
 }
 
-/// Build the shell command that launches the agent's harness (agent runtime) in its tmux window, per the
-/// selected `harness`. This is the one seam every harness plugs into: the window launch, trust, and kickoff
-/// are harness-agnostic, only this command differs. The kickoff rides in `$CDZ_KICKOFF` (set on the window),
-/// so the command references that env var rather than interpolating the prompt. Pure so it is unit-tested.
-///
-/// `claude` and `codex` are both wired. Each takes a persistent-TUI launch that reads its initial prompt
-/// from `$CDZ_KICKOFF`; the kickoff prose itself drives the recurring loop, so the two share one kickoff and
-/// wake path and differ only in the CLI's own launch flags. `codex` reaches its model through whatever the
-/// agent's `metadata.model` names, which for a codex agent is an OpenAI-wire model name (the codex CLI speaks
-/// the OpenAI wire protocol) rather than a Claude model id — this arm passes it through unchanged, so the
-/// concrete name lives in board data, not here. An unknown harness is rejected so a typo'd `metadata.harness`
-/// fails loudly at spin-up instead of launching nothing.
-/// `devshell` (opt-in, `metadata.devshell = true`): when `Some(workdir)`, launch INSIDE that workdir's flake
-/// devShell (`nix develop "path:<workdir>" --command …`) so the flake-pinned toolchain (node/cargo/python/…)
-/// is on PATH instead of the host's — the host PATH drifts (e.g. host node v18 breaks a flake-pinned build,
-/// bare `curl`/`python3` intermittently miss in a compound shell call), and each agent otherwise re-derives
-/// per-charter workarounds (#214). Default `None` = launch on the host PATH exactly as before. The caller
-/// only sets it for an agent whose workdir is a flake with a devShell.
+/// Launch the managed Codex host inside the existing tmux window/devShell.
+/// Fleet never overrides Codex permissions or modifies user/managed configuration.
 fn build_launch_cmd(
     harness: &str,
     model: &str,
     effort: &str,
     devshell: Option<&str>,
 ) -> Result<String, String> {
-    match harness {
-        "claude" => {
-            // effort/model are single-quoted (no single-quotes in them) so `[1m]` can't glob; the kickoff
-            // rides in $CDZ_KICKOFF (set literally via `-e`, expanded double-quoted) so its spaces/quotes
-            // are safe.
-            let claude = format!(
-                "claude --disallowedTools AskUserQuestion --effort '{effort}' --model '{model}' \
-                 --autocompact 600000 --dangerously-skip-permissions \"$CDZ_KICKOFF\""
-            );
-            Ok(match devshell {
-                Some(dir) => format!("exec nix develop \"path:{dir}\" --command {claude}"),
-                None => format!("exec {claude}"),
-            })
-        }
-        "codex" => {
-            // The bypass flag runs unattended (no per-action approval, no sandbox); the model is
-            // single-quoted so nothing in it can glob; the kickoff rides in $CDZ_KICKOFF (set literally via
-            // `-e`, expanded double-quoted) so its spaces/quotes are safe. codex still gates a first-run
-            // launch on per-workspace folder trust, which the bypass flag does NOT skip — spin-up pre-trusts
-            // the workdir out of band, so the launch itself does not carry it.
-            let codex = format!(
-                "codex --dangerously-bypass-approvals-and-sandbox --model '{model}' \"$CDZ_KICKOFF\""
-            );
-            Ok(match devshell {
-                Some(dir) => format!("exec nix develop \"path:{dir}\" --command {codex}"),
-                None => format!("exec {codex}"),
-            })
-        }
-        other => Err(format!(
-            "unknown harness '{other}' (known: claude, codex) — set metadata.harness on the agent's board record"
-        )),
+    let selected = resolve_model(model);
+    if harness != "codex" || selected != model {
+        eprintln!("fleet: runtime {harness:?}, model {model:?} -> Codex {selected}");
     }
+    let model = selected.as_str();
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let config_arg = config::current_path()
+        .map(|path| format!(" --config {}", quote(&path.to_string_lossy())))
+        .unwrap_or_default();
+    let command = format!(
+        "{}{config_arg} codex-session --agent \"$FLEET_AGENT\" --model {} --effort {} --interval \"${{FLEET_INTERVAL:-30m}}\"",
+        quote(&executable.to_string_lossy()),
+        quote(model),
+        quote(effort)
+    );
+    Ok(match devshell {
+        Some(dir) => format!(
+            "exec nix develop {} --command {command}",
+            quote(&format!("path:{dir}"))
+        ),
+        None => format!("exec {command}"),
+    })
 }
 
 /// The graceful spin-down decision for a board-native agent, given whether its board record is `native`,
@@ -7321,7 +7378,17 @@ fn launch_board_agent(
         proactive_ownership,
     );
     let cmd = build_launch_cmd(harness, model, effort, devshell.then_some(workdir))?;
-    let argv = board_window_argv(&session, agent, workdir, &kickoff, &cmd);
+    let mut argv = board_window_argv(&session, agent, workdir, &kickoff, &cmd);
+    let end = argv.len() - 1;
+    argv.splice(
+        end..end,
+        [
+            "-e".into(),
+            format!("FLEET_INTERVAL={interval}"),
+            "-e".into(),
+            "FLEET_BOARD_NATIVE=1".into(),
+        ],
+    );
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
     let status = std::process::Command::new("tmux")
         .args(&argv_ref)
@@ -7470,11 +7537,9 @@ fn pre_trust_dirs_codex(dirs: &[String]) -> Result<bool, String> {
 /// Pre-trust `dirs` in the folder-trust store of the given `harness`, so a spun-up agent never stalls on the
 /// one-time folder-trust prompt: `codex` → `~/.codex/config.toml`; every other harness (claude, the default)
 /// → `~/.claude.json`. Returns whether it wrote a change.
-fn pre_trust_for_harness(harness: &str, dirs: &[String]) -> Result<bool, String> {
-    match harness {
-        "codex" => pre_trust_dirs_codex(dirs),
-        _ => pre_trust_dirs(dirs),
-    }
+fn pre_trust_for_harness(_harness: &str, _dirs: &[String]) -> Result<bool, String> {
+    // Authentication, workspace trust and permissions are managed outside Fleet.
+    Ok(false)
 }
 
 /// How stale a board `last_seen` is allowed to get before the watchdog cares. An agent heartbeats far more
@@ -7903,10 +7968,9 @@ fn pane_shows_working(pane_text: &str) -> bool {
 /// Is the agent's pane actively working right now? Captures the visible pane and classifies it. A capture
 /// failure (no window / tmux error) returns false — the caller then treats "not working" per its own
 /// window-existence handling (the wake inject itself no-ops on a missing window).
-fn window_is_working(session: &str, agent: &str) -> bool {
-    capture_pane(session, agent)
-        .map(|s| pane_shows_working(&s))
-        .unwrap_or(false)
+fn window_is_working(_session: &str, agent: &str) -> bool {
+    // Unknown, stale, or paused execution state must not trigger an automated wake.
+    session_host::read_status(&codex_state_root(), agent).as_deref() != Some("idle")
 }
 
 /// Unix mtime (whole seconds) of a file, or `None` if it's absent / unreadable. Used to age a file-hub
@@ -8808,9 +8872,8 @@ fn spawn_observer(
     if let Err(e) = std::fs::create_dir_all(&workdir) {
         return format!("spawn-FAILED(mkdir {workdir}: {e})");
     }
-    let _ = pre_trust_dirs(&[fleet_root.clone(), workdir.clone()]);
-    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high", None) {
-        Ok(c) => c,
+    let cmd = match build_launch_cmd("codex", "default", "high", None) {
+        Ok(c) => format!("{c} --once"),
         Err(e) => return format!("spawn-FAILED({e})"),
     };
     match std::process::Command::new("tmux")
@@ -8825,6 +8888,8 @@ fn spawn_observer(
             &workdir,
             "-e",
             &format!("CDZ_KICKOFF={kickoff}"),
+            "-e",
+            &format!("FLEET_AGENT={window}"),
             &cmd,
         ])
         .status()
@@ -8879,9 +8944,8 @@ fn spawn_reviewer(
     if let Err(e) = std::fs::create_dir_all(&workdir) {
         return format!("spawn-FAILED(mkdir {workdir}: {e})");
     }
-    let _ = pre_trust_dirs(&[fleet_root.clone(), workdir.clone()]);
-    let cmd = match build_launch_cmd("claude", &resolve_model("opus"), "high", None) {
-        Ok(c) => c,
+    let cmd = match build_launch_cmd("codex", "default", "high", None) {
+        Ok(c) => format!("{c} --once"),
         Err(e) => return format!("spawn-FAILED({e})"),
     };
     match std::process::Command::new("tmux")
@@ -8896,6 +8960,8 @@ fn spawn_reviewer(
             &workdir,
             "-e",
             &format!("CDZ_KICKOFF={kickoff}"),
+            "-e",
+            &format!("FLEET_AGENT={window}"),
             &cmd,
         ])
         .status()
@@ -15166,7 +15232,7 @@ fn dedup_check(filter: Option<&str>, kill: bool) {
             if std::fs::read_to_string(e.path().join("comm"))
                 .unwrap_or_default()
                 .trim()
-                != "claude"
+                != "codex"
             {
                 continue;
             }
@@ -15394,7 +15460,7 @@ fn mcp_check(agent: &str) {
             if std::fs::read_to_string(e.path().join("comm"))
                 .unwrap_or_default()
                 .trim()
-                != "claude"
+                != "codex"
             {
                 continue;
             }
@@ -15834,7 +15900,7 @@ mod tests {
         );
         // Dynamic loop (no fixed interval arg after /loop) — the agent self-paces.
         assert!(
-            k.contains("/loop run one tick"),
+            k.contains("Fleet schedules turns"),
             "dynamic /loop, not `/loop 30m`"
         );
         assert!(
@@ -15989,37 +16055,12 @@ mod tests {
     }
 
     #[test]
-    fn build_kickoff_above_one_hour_escalates_to_a_fixed_interval_cron() {
-        // task_765 Tier A: the dynamic /loop self-wake clamps to a 1h max, so a monitor whose idle cadence
-        // exceeds an hour (3h here) idle-polls hourly unless it rests off a CronCreate fixed-interval loop.
-        // The kickoff must say so and hand it the concrete cron.
-        let k = build_kickoff("v-mon", "/wt/v-mon", "3h", Some("op-x"), false, false);
-        assert!(
-            k.contains("hard-clamped to a ONE-HOUR maximum"),
-            "names the dynamic self-wake 1h clamp (the root cause)"
-        );
-        assert!(
-            k.contains("CronCreate"),
-            "routes a >1h cadence to a CronCreate fixed-interval loop"
-        );
-        assert!(
-            k.contains("'0 */3 * * *'"),
-            "hands a 3h cadence its concrete cron expression"
-        );
-        assert!(
-            k.contains("do NOT also self-re-arm"),
-            "warns against a dynamic re-arm fighting the cron (the observed failure)"
-        );
-        assert!(
-            k.contains("never your revival latency"),
-            "clarifies event-wake still revives immediately, so the cron only sets the idle floor"
-        );
-        // A reactive responder with a >1h cadence hits the same clamp, so it carries the clause too.
-        let r = build_kickoff("frank", "/wt/frank", "2h", None, true, false);
-        assert!(
-            r.contains("CronCreate") && r.contains("'0 */2 * * *'"),
-            "a >1h reactive cadence also gets the cron escalation"
-        );
+    fn long_cadence_is_owned_by_the_managed_host() {
+        let kickoff = build_kickoff("v-x", "/wt/v-x", "3h", None, false, false);
+        assert!(kickoff.contains("Fleet schedules turns"));
+        assert!(kickoff.contains("about 3h"));
+        assert!(!kickoff.contains("CronCreate"));
+        assert!(!kickoff.contains("/loop"));
     }
 
     #[test]
@@ -16182,7 +16223,7 @@ mod tests {
             "reactive kickoff still self-discovers"
         );
         assert!(r.contains("'frank'"), "carries the agent id");
-        assert!(r.contains("/loop run one tick"), "still a dynamic /loop");
+        assert!(r.contains("Fleet schedules turns"), "still a dynamic /loop");
         // The reactive discipline (#438): only being ADDRESSED is actionable; ambient chatter is NOT work.
         assert!(r.contains("REACTIVE responder"), "declares reactive mode");
         assert!(
@@ -16223,55 +16264,24 @@ mod tests {
     }
 
     #[test]
-    fn build_launch_cmd_wires_claude_and_codex_and_rejects_unknown() {
-        // claude is fully wired: the exec line carries the model/effort and reads the kickoff from the env.
-        let c = build_launch_cmd("claude", "claude-x", "high", None).expect("claude wired");
-        assert!(c.starts_with("exec claude "));
-        assert!(c.contains("--model 'claude-x'") && c.contains("--effort 'high'"));
+    fn launch_uses_managed_codex_and_rejects_legacy_runtime() {
+        let command = build_launch_cmd("codex", "default", "high", None).unwrap();
+        assert!(command.contains("codex-session --agent"));
+        assert!(!command.contains("dangerously"));
+        assert!(!command.contains("--sandbox"));
         assert!(
-            c.contains("\"$CDZ_KICKOFF\""),
-            "kickoff rides in the env var, not interpolated"
-        );
-        // devshell (#214): opt-in launch inside the workdir's flake devShell so the pinned toolchain is on PATH.
-        let d =
-            build_launch_cmd("claude", "claude-x", "high", Some("/wt/v-x")).expect("claude wired");
-        assert!(
-            d.starts_with("exec nix develop \"path:/wt/v-x\" --command claude "),
-            "wrapped in nix develop"
+            build_launch_cmd("claude", "default", "high", None)
+                .unwrap()
+                .contains("gpt-6-astra")
         );
         assert!(
-            d.contains("--model 'claude-x'") && d.contains("\"$CDZ_KICKOFF\""),
-            "same claude args inside the devShell"
+            build_launch_cmd("codex", "opus", "high", None)
+                .unwrap()
+                .contains("gpt-6-astra")
         );
-        // codex is wired: bypass flag for unattended run, model passed through single-quoted, kickoff from env.
-        let x = build_launch_cmd("codex", "codex-m", "high", None).expect("codex wired");
-        assert!(x.starts_with("exec codex "));
-        assert!(
-            x.contains("--dangerously-bypass-approvals-and-sandbox"),
-            "unattended: no approval/sandbox gate"
-        );
-        assert!(
-            x.contains("--model 'codex-m'"),
-            "model passed through (board data supplies the concrete name)"
-        );
-        assert!(
-            x.contains("\"$CDZ_KICKOFF\""),
-            "codex reads the same kickoff env var, not an interpolated prompt"
-        );
-        assert!(
-            !x.contains("--effort"),
-            "codex takes no --effort flag (claude-only)"
-        );
-        // codex honors the same devShell wrapping as claude.
-        let xd =
-            build_launch_cmd("codex", "codex-m", "high", Some("/wt/v-x")).expect("codex wired");
-        assert!(
-            xd.starts_with("exec nix develop \"path:/wt/v-x\" --command codex "),
-            "codex wrapped in nix develop too"
-        );
-        // an unknown/typo'd harness fails loudly.
-        let u = build_launch_cmd("gpt5", "m", "high", None).unwrap_err();
-        assert!(u.contains("unknown harness 'gpt5'"));
+        let wrapped = build_launch_cmd("codex", "model'x", "high", Some("/work tree")).unwrap();
+        assert!(wrapped.starts_with("exec nix develop 'path:/work tree' --command"));
+        assert!(wrapped.contains("gpt-6-astra"));
     }
 
     #[test]
@@ -20133,22 +20143,10 @@ value = \"/repo/.claude/worktrees/dead/target\"
     }
 
     #[test]
-    fn resolve_model_expands_aliases_and_passes_through_unknown() {
-        assert_eq!(resolve_model("opus"), "us.anthropic.claude-opus-5-5[1m]");
-        assert_eq!(resolve_model("fable"), "us.anthropic.claude-fable-5[1m]");
-        assert_eq!(resolve_model("sonnet"), "us.anthropic.claude-sonnet-5");
-        // The bare Anthropic-API id is remapped to the valid Bedrock id (the board-triage/-follow-up outage:
-        // `claude-sonnet-5-5` 400s on this fleet's endpoint), so a mis-registered agent self-heals on launch.
-        assert_eq!(
-            resolve_model("claude-sonnet-5-5"),
-            "us.anthropic.claude-sonnet-5"
-        );
-        assert_eq!(resolve_model("sonnet-5-5"), "us.anthropic.claude-sonnet-5");
-        assert_eq!(
-            resolve_model("some.custom.model-id"),
-            "some.custom.model-id",
-            "unknown alias passes through unchanged"
-        );
+    fn model_ids_are_not_provider_aliases() {
+        assert_eq!(resolve_model("default"), "gpt-6-astra");
+        assert_eq!(resolve_model("opus"), "gpt-6-astra");
+        assert_eq!(resolve_model("gpt-6-astra"), "gpt-6-astra");
     }
 
     #[test]
@@ -21052,7 +21050,7 @@ value = \"/repo/.claude/worktrees/dead/target\"
         assert_eq!(cfg.agents[0].name, "v-iterators");
         // defaults applied where omitted
         assert_eq!(cfg.agents[0].interval, "10m");
-        assert_eq!(cfg.agents[0].model, "opus");
+        assert_eq!(cfg.agents[0].model, "default");
         assert_eq!(cfg.agents[1].model, "fable");
         assert_eq!(cfg.agents[1].effort, "high", "default effort");
     }

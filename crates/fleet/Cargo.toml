@@ -29,6 +29,13 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 # blocking-accept server scales badly across many fleet hosts, the no-blocking-IO policy's clearest
 # target). Scoped to notify.rs only — every other `fleet` subcommand is a one-shot CLI invocation and
 # stays sync (ureq); this does not make the whole binary async.
-tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "signal", "process", "sync", "fs"] }
 # sha256 for the memory-sync per-slug content-hash state + the dream-pass exact-dup body identity.
 sha2 = "0.10"
+
+# Managed Codex app-server process lifecycle.
+anyhow = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -96,6 +96,38 @@ impl Harness for Codex {
     }
 
     fn render_record(&self, rec: &Value) -> Option<String> {
+        // Managed app-server JSONL: completed items contain the authoritative final
+        // message/tool payload. Keep full JSON alongside readable message text so
+        // unfamiliar fields and tool outputs are never silently discarded.
+        if let Some(method) = rec.get("method").and_then(Value::as_str) {
+            if method == "item/completed" {
+                let item = &rec["params"]["item"];
+                let kind = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let mut output = format!("── {kind} ──\n");
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    output.push_str(text);
+                    output.push('\n');
+                }
+                output.push_str(
+                    &serde_json::to_string_pretty(rec).unwrap_or_else(|_| rec.to_string()),
+                );
+                output.push('\n');
+                return Some(output);
+            }
+            // Deltas duplicate final items; account for them as omitted bookkeeping.
+            if method.ends_with("/delta")
+                || matches!(method, "item/started" | "thread/started" | "turn/started")
+            {
+                return None;
+            }
+            return Some(format!("[app-server {method}]\n{rec}\n"));
+        }
+        if rec.get("id").is_some() && (rec.get("result").is_some() || rec.get("error").is_some()) {
+            return Some(format!("[app-server response]\n{rec}\n"));
+        }
         // Only `response_item` records carry conversation; every other top-level type is bookkeeping (counted).
         if rec.get("type").and_then(Value::as_str) != Some("response_item") {
             return None;
@@ -292,6 +324,7 @@ pub fn render(records: &[Value], harness: &dyn Harness) -> String {
             None => {
                 let ty = rec
                     .get("type")
+                    .or_else(|| rec.get("method"))
                     .and_then(Value::as_str)
                     .unwrap_or("?")
                     .to_string();
@@ -471,7 +504,58 @@ fn locate_sessions_where(dir_belongs: impl Fn(&str) -> bool) -> Vec<PathBuf> {
 /// the agent. Best-effort: an exact target is available via `--session <file>` at the CLI. Returns an empty
 /// vec when nothing matches.
 pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
+    let managed = locate_managed_sessions(&crate::codex_state_root(), agent);
+    if !managed.is_empty() {
+        return managed;
+    }
     locate_sessions_where(|slug| slug_is_for_agent(slug, agent))
+}
+
+/// Managed host logs, without following agent-directory or log-file symlinks.
+fn locate_managed_sessions(root: &Path, agent: &str) -> Vec<PathBuf> {
+    if agent.is_empty()
+        || agent.len() > 64
+        || !agent
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Vec::new();
+    }
+    let directory = root.join(agent);
+    if !std::fs::symlink_metadata(&directory)
+        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+    {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let candidate =
+            if kind.is_file() && path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                path
+            } else if kind.is_dir() && entry.file_name().to_string_lossy().starts_with("turn-") {
+                path.join("events.jsonl")
+            } else {
+                continue;
+            };
+        if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
+            && metadata.is_file()
+            && !metadata.file_type().is_symlink()
+        {
+            files.push((
+                metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+                candidate,
+            ));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    files.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Like [`locate_sessions`], but roster-aware: a dir counts for `agent` only when `agent` is its owner (the
@@ -483,6 +567,10 @@ pub fn locate_sessions(agent: &str) -> Vec<PathBuf> {
 /// Falls back to the bare match for a dir no roster id owns (empty roster / unknown agent), so behavior is
 /// unchanged outside the dash-prefix case.
 pub fn locate_sessions_disambiguated(agent: &str, roster: &[String]) -> Vec<PathBuf> {
+    let managed = locate_managed_sessions(&crate::codex_state_root(), agent);
+    if !managed.is_empty() {
+        return managed;
+    }
     locate_sessions_where(|slug| match slug_owner(slug, roster) {
         Some(owner) => owner == agent,
         None => slug_is_for_agent(slug, agent),
@@ -508,6 +596,15 @@ pub fn window_start(since_offset: usize, overlap: usize) -> usize {
 
 /// The session id (file stem) of a JSONL path.
 pub fn session_id_of(path: &Path) -> String {
+    if path.file_name().and_then(|s| s.to_str()) == Some("events.jsonl")
+        && let Some(name) = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .filter(|name| name.starts_with("turn-"))
+    {
+        return name.to_string();
+    }
     path.file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("")
@@ -536,6 +633,45 @@ pub fn parse_jsonl(path: &Path) -> Result<(Vec<Value>, usize), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_appserver_messages_tools_and_unknown_events_are_faithful() {
+        let records = vec![
+            serde_json::json!({"method":"item/completed","params":{"threadId":"t","item":{"type":"agentMessage","id":"m","text":"Finished checking files"}}}),
+            serde_json::json!({"method":"item/completed","params":{"item":{"type":"commandExecution","command":"cargo test","aggregatedOutput":"3 passed","exitCode":0}}}),
+            serde_json::json!({"method":"future/event","params":{"evidence":"keep me"}}),
+            serde_json::json!({"method":"item/agentMessage/delta","params":{"delta":"duplicated"}}),
+        ];
+        let out = super::render(&records, &super::Codex);
+        assert!(out.contains("Finished checking files"));
+        assert!(out.contains("cargo test") && out.contains("3 passed") && out.contains("exitCode"));
+        assert!(out.contains("keep me"));
+        assert!(!out.contains("duplicated"));
+        assert!(out.contains("item/agentMessage/delta×1"));
+    }
+
+    #[test]
+    fn managed_discovery_is_agent_scoped_and_turn_ids_are_unique() {
+        let root = tempfile::tempdir().unwrap();
+        for (agent, turn) in [
+            ("worker", "turn-100"),
+            ("worker", "turn-200"),
+            ("worker-helper", "turn-300"),
+        ] {
+            let dir = root.path().join(agent).join(turn);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("events.jsonl"), "{}\n").unwrap();
+        }
+        let files = super::locate_managed_sessions(root.path(), "worker");
+        assert_eq!(files.len(), 2);
+        let ids: std::collections::BTreeSet<_> =
+            files.iter().map(|p| super::session_id_of(p)).collect();
+        assert_eq!(
+            ids,
+            std::collections::BTreeSet::from(["turn-100".to_string(), "turn-200".to_string()])
+        );
+        assert!(super::locate_managed_sessions(root.path(), "../worker").is_empty());
+    }
+
     use super::*;
 
     fn sample() -> Vec<Value> {

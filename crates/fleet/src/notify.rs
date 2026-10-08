@@ -3,13 +3,11 @@
 //!
 //! The board push-fires a best-effort HTTP POST to each agent's registered `webhook_url` for every inbox
 //! event, carrying `recipient`, `type`, `task_id`, `event_seq`, … (never polling). Division of labor: the
-//! board emits events; the FLEET owns the wake, because the wake target is a tmux window only the host with
-//! tmux access can reach. So this is ONE long-running endpoint, registered as each board-backed agent's
-//! `webhook_url`; on each POST it maps the event to a wake prompt and `tmux send-keys` injects it into the
-//! recipient's window — `[notification] task #<task_id>` for a task assignment, `[notification] message
+//! board emits events; FLEET owns the managed session wake over a private Unix socket.
+//! This remains one endpoint registered as each board-backed agent's `webhook_url`.
+//! Each POST maps the event to a prompt accepted by the local managed session host — `[notification] task #<task_id>` for a task assignment, `[notification] message
 //! #<event_seq>` for a direct message — so the agent reacts to the event instead of polling.
 
-use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -154,68 +152,67 @@ pub fn payload_to_wake(v: &Value) -> Option<(String, String)> {
     Some((recipient.to_string(), prompt))
 }
 
-/// Delay after the literal paste — and between the two submit `Enter`s — that lets a full-screen TUI composer
-/// commit the pasted text before a submitting keystroke arrives. See [`submit_steps`] for why.
-const INJECT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
-
-/// One step of the wake-injection sequence built by [`submit_steps`].
-#[derive(Debug, PartialEq, Eq)]
-enum InjectStep<'a> {
-    /// `send-keys -l <text>`: paste the text literally (no character is read as a key binding).
-    Literal(&'a str),
-    /// `send-keys Enter`: a submit keystroke.
-    Enter,
-    /// Sleep [`INJECT_SETTLE`] to let the composer commit the preceding input before the next keystroke.
-    Settle,
-}
-
-/// The ordered steps to inject `text` as a SUBMITTED prompt: paste the text, settle, `Enter`, settle,
-/// `Enter`. The settle + second `Enter` exist because a full-screen TUI composer (the codex harness) processes
-/// a bracketed paste asynchronously — an `Enter` sent immediately after the paste can arrive before the
-/// composer has committed the text and be dropped, leaving the prompt sitting unsubmitted; settling lets the
-/// paste commit, and the second `Enter` is a belt-and-suspenders submit if the first still raced. This is
-/// harmless for the claude harness (the proven wake path): its `Enter` submits the now-committed prompt, and
-/// the second `Enter` lands on an empty composer, where `Enter` is a no-op — so the wake still fires exactly
-/// once. Pure — unit-tested.
-fn submit_steps(text: &str) -> Vec<InjectStep<'_>> {
-    vec![
-        InjectStep::Literal(text),
-        InjectStep::Settle,
-        InjectStep::Enter,
-        InjectStep::Settle,
-        InjectStep::Enter,
-    ]
-}
-
-/// Inject `text` as a submitted prompt into tmux window `session:window`, following [`submit_steps`] (paste
-/// literally, settle so a TUI composer commits the paste, then submit — with a second settle+`Enter` as a
-/// harmless-for-claude belt-and-suspenders submit that also lands a codex wake). `Err` if the window is absent
-/// or tmux is unreachable.
-pub fn tmux_inject(session: &str, window: &str, text: &str) -> Result<(), String> {
-    let target = format!("{session}:{window}");
-    for step in submit_steps(text) {
-        match step {
-            InjectStep::Literal(t) => {
-                let sent = Command::new("tmux")
-                    .args(["send-keys", "-t", &target, "-l", t])
-                    .status()
-                    .map_err(|e| format!("tmux send-keys -t {target}: {e}"))?;
-                if !sent.success() {
-                    return Err(format!(
-                        "tmux send-keys -l to {target} failed (window absent?)"
-                    ));
-                }
-            }
-            InjectStep::Enter => {
-                Command::new("tmux")
-                    .args(["send-keys", "-t", &target, "Enter"])
-                    .status()
-                    .map_err(|e| format!("tmux send-keys Enter -t {target}: {e}"))?;
-            }
-            InjectStep::Settle => std::thread::sleep(INJECT_SETTLE),
-        }
+/// Send a bounded managed-session control request; success means host acceptance.
+pub fn session_control(
+    state_root: &std::path::Path,
+    agent: &str,
+    request: Value,
+) -> Result<(), String> {
+    use std::io::{BufRead, Read, Write};
+    use std::os::unix::net::UnixStream;
+    if agent.is_empty()
+        || agent.len() > 64
+        || !agent
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("invalid agent identifier".into());
+    }
+    let mut encoded = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    if encoded.len() > 64 * 1024 {
+        return Err("session control request exceeds 64KiB".into());
+    }
+    encoded.push(b'\n');
+    let socket = state_root.join(agent).join("control.sock");
+    let mut stream =
+        UnixStream::connect(socket).map_err(|e| format!("connect managed session: {e}"))?;
+    let timeout = Some(std::time::Duration::from_secs(2));
+    stream
+        .set_read_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    stream
+        .set_write_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    stream
+        .write_all(&encoded)
+        .map_err(|e| format!("write managed session: {e}"))?;
+    let mut response = String::new();
+    std::io::BufReader::new(stream)
+        .take(4096)
+        .read_line(&mut response)
+        .map_err(|e| format!("read managed session: {e}"))?;
+    if !response.ends_with('\n') {
+        return Err("incomplete managed session acknowledgement".into());
+    }
+    let response: Value = serde_json::from_str(&response)
+        .map_err(|_| "invalid managed session acknowledgement".to_string())?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("managed session rejected control request".into());
     }
     Ok(())
+}
+
+pub fn session_inject(state_root: &std::path::Path, agent: &str, text: &str) -> Result<(), String> {
+    session_control(state_root, agent, serde_json::json!({"prompt":text}))
+}
+
+pub fn session_interrupt(state_root: &std::path::Path, agent: &str) -> Result<(), String> {
+    session_control(state_root, agent, serde_json::json!({"interrupt":true}))
+}
+
+/// Existing callers retain their host/session routing signature; delivery uses the managed local socket.
+pub fn tmux_inject(_session: &str, agent: &str, text: &str) -> Result<(), String> {
+    session_inject(&crate::codex_state_root(), agent, text)
 }
 
 /// How the notifier handles one incoming request. The board POSTs webhook events; a supervisor (a systemd
@@ -354,7 +351,7 @@ const DRIFT_ESCALATE_N: u32 = 2;
 /// stop-and-return `Escalate`. Any board or store error yields `None` — a drift check must never block or
 /// corrupt the wake itself.
 fn drift_wake_prefix(hub_root: &std::path::Path, agent: &str) -> Option<String> {
-    let board = crate::board::Board::connect().ok()?;
+    let board = crate::board::Board::connect_timeout(std::time::Duration::from_millis(100)).ok()?;
     let presence = board
         .get_agent(agent)
         .ok()?
@@ -373,52 +370,122 @@ fn drift_wake_prefix(hub_root: &std::path::Path, agent: &str) -> Option<String> 
     crate::drift::directive_text(action)
 }
 
-async fn handle_connection(
+/// A board event identity is supplied by the board, never derived from prompt text.
+fn payload_to_control(event: &Value) -> Option<(String, Value)> {
+    let (recipient, mut request) =
+        if event.get("type").and_then(Value::as_str) == Some("session.abort") {
+            (
+                event.get("recipient")?.as_str()?.to_string(),
+                serde_json::json!({"interrupt":true}),
+            )
+        } else {
+            let (recipient, prompt) = payload_to_wake(event)?;
+            (recipient, serde_json::json!({"prompt":prompt}))
+        };
+    if let Some(sequence) = event.get("event_seq").and_then(Value::as_i64) {
+        request["event_id"] = serde_json::json!(format!("{recipient}:{sequence}"));
+    }
+    Some((recipient, request))
+}
+
+async fn respond(stream: &mut TcpStream, status: &str) {
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.write_all(response.as_bytes()),
+    )
+    .await;
+}
+
+async fn handle_connection(stream: TcpStream, hub_root: Arc<std::path::Path>) {
+    handle_connection_at(
+        stream,
+        hub_root,
+        crate::codex_state_root(),
+        true,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+}
+
+async fn handle_connection_at(
     mut stream: TcpStream,
-    session: Arc<str>,
     hub_root: Arc<std::path::Path>,
+    state_root: std::path::PathBuf,
+    with_drift: bool,
+    delivery_timeout: std::time::Duration,
 ) {
-    let (method, path, body) = match read_request(&mut stream).await {
-        Ok(parts) => parts,
-        Err(e) => {
-            eprintln!("fleet notify: dropping unreadable request: {e}");
+    let (method, path, body) =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), read_request(&mut stream))
+            .await
+        {
+            Ok(Ok(parts)) => parts,
+            _ => {
+                respond(&mut stream, "400 Bad Request").await;
+                return;
+            }
+        };
+    if classify_request(&method, &path) == Incoming::HealthProbe {
+        respond(&mut stream, "200 OK").await;
+        return;
+    }
+    let event: Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            respond(&mut stream, "400 Bad Request").await;
             return;
         }
     };
-    let _ = stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-        .await;
-    if classify_request(&method, &path) == Incoming::HealthProbe {
+    let Some((recipient, mut request)) = payload_to_control(&event) else {
+        // Intentional policy suppression is successful handling, not failed delivery.
+        respond(&mut stream, "204 No Content").await;
         return;
-    }
-    match serde_json::from_str::<Value>(&body) {
-        // presence/comment/other events yield no prompt and are silently dropped
-        Ok(v) => {
-            if let Some((recipient, prompt)) = payload_to_wake(&v) {
-                tokio::task::spawn_blocking(move || {
-                    // task_1325 slice 2b: prepend the fleet-detected enforced drift directive, if any. The
-                    // board read + DriftState persist are sync (board.rs ureq) and run here inside
-                    // spawn_blocking, so they stay off the async executor like tmux_inject itself.
-                    let prompt = match drift_wake_prefix(&hub_root, &recipient) {
-                        Some(dir) => format!("{dir}\n\n{prompt}"),
-                        None => prompt,
-                    };
-                    match tmux_inject(&session, &recipient, &prompt) {
-                        Ok(()) => eprintln!("woke {recipient}: {prompt}"),
-                        Err(e) => eprintln!("inject failed for {recipient}: {e}"),
-                    }
-                });
-            }
+    };
+    if with_drift && request.get("prompt").is_some() {
+        let agent = recipient.clone();
+        let prefix = tokio::task::spawn_blocking(move || drift_wake_prefix(&hub_root, &agent));
+        // Drift is advisory and must not hold delivery behind an unavailable board.
+        if let Ok(Ok(Some(prefix))) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), prefix).await
+        {
+            request["prompt"] = serde_json::json!(format!(
+                "{prefix}\n\n{}",
+                request["prompt"].as_str().unwrap_or_default()
+            ));
         }
-        Err(e) => eprintln!("fleet notify: dropping unparseable webhook body: {e}"),
     }
+    // Only board-issued identities permit retry after an ambiguous acknowledgement.
+    // The host durably deduplicates these IDs before acknowledging acceptance.
+    let attempts = if request.get("event_id").is_some() {
+        2
+    } else {
+        1
+    };
+    for attempt in 0..attempts {
+        let root = state_root.clone();
+        let agent = recipient.clone();
+        let payload = request.clone();
+        let delivery = tokio::task::spawn_blocking(move || session_control(&root, &agent, payload));
+        if matches!(
+            tokio::time::timeout(delivery_timeout, delivery).await,
+            Ok(Ok(Ok(())))
+        ) {
+            respond(&mut stream, "200 OK").await;
+            return;
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    respond(&mut stream, "503 Service Unavailable").await;
 }
 
 /// Run the notifier: bind a local HTTP endpoint and, for each board webhook POST, inject the wake prompt
-/// into the recipient agent's tmux window in `session`. Blocks (a long-running daemon) — but each connection
+/// into the recipient agent's managed Codex session. Blocks (a long-running daemon) — but each connection
 /// runs on its own tokio task ([`handle_connection`]), so a slow wake injection on one event never stalls the
-/// board's next webhook POST or a liveness probe arriving concurrently. Best-effort: every request is
-/// answered `200` immediately, and a payload that is unparseable or not actionable is logged and dropped. A
+/// board's next webhook POST or a liveness probe arriving concurrently. Actionable events receive `200` only after host acknowledgement; failures return `503`.
+/// Malformed input returns `400`; intentionally ignored events return `204`. The board currently does not
+/// retry webhook failures, so its durable inbox remains the fallback. A
 /// supervisor liveness-probes the daemon with a `GET` to `/health` (see [`classify_request`]).
 pub fn serve(port: u16, session: &str, hub_root: &std::path::Path) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -435,14 +502,13 @@ async fn serve_async(port: u16, session: &str, hub_root: &std::path::Path) -> Re
     eprintln!(
         "fleet notify: listening on http://127.0.0.1:{port} — waking session '{session}' on board webhooks (GET /health for liveness)"
     );
-    let session: Arc<str> = Arc::from(session);
     let hub_root: Arc<std::path::Path> = Arc::from(hub_root);
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|e| format!("fleet notify: accept: {e}"))?;
-        tokio::spawn(handle_connection(stream, session.clone(), hub_root.clone()));
+        tokio::spawn(handle_connection(stream, hub_root.clone()));
     }
 }
 
@@ -451,32 +517,214 @@ mod tests {
     use super::*;
 
     #[test]
-    fn submit_steps_pastes_then_settles_and_double_enters() {
-        let steps = submit_steps("[notification] message #5");
-        // Paste the literal text first, so no character is read as a key binding.
+    fn board_event_identity_survives_duplicate_delivery_and_interrupt() {
+        let event = serde_json::json!({"recipient":"worker","type":"task.assigned","task_id":5,"event_seq":91});
+        let first = payload_to_control(&event).unwrap();
+        assert_eq!(first, payload_to_control(&event).unwrap());
+        assert_eq!(first.1["event_id"], "worker:91");
+        let interrupt = payload_to_control(
+            &serde_json::json!({"recipient":"worker","type":"session.abort","event_seq":92}),
+        )
+        .unwrap();
         assert_eq!(
-            steps.first(),
-            Some(&InjectStep::Literal("[notification] message #5"))
+            interrupt.1,
+            serde_json::json!({"interrupt":true,"event_id":"worker:92"})
         );
-        // A settle must separate the paste from the FIRST Enter — the codex composer commits the paste in that
-        // window, so the submitting Enter is not dropped racing the async paste.
-        let first_enter = steps
-            .iter()
-            .position(|s| *s == InjectStep::Enter)
-            .expect("has an Enter");
+        let unsequenced = payload_to_control(
+            &serde_json::json!({"recipient":"worker","type":"task.assigned","task_id":5}),
+        )
+        .unwrap();
+        assert!(unsequenced.1.get("event_id").is_none());
+    }
+
+    async fn http_delivery_case(
+        accepted: bool,
+        retry_succeeds: bool,
+        host_delay: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> String {
+        use std::io::{BufRead, Write};
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "notify-http-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("worker")).unwrap();
+        let host =
+            std::os::unix::net::UnixListener::bind(root.join("worker/control.sock")).unwrap();
+        let host = std::thread::spawn(move || {
+            for attempt in 0..if retry_succeeds { 2 } else { 1 } {
+                let (mut socket, _) = host.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(socket.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&line).unwrap()["event_id"],
+                    "worker:7"
+                );
+                std::thread::sleep(host_delay);
+                let accepted = accepted || (retry_succeeds && attempt == 1);
+                let response = format!("{{\"ok\":{accepted}}}\n");
+                let _ = socket.write_all(response.as_bytes());
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let root_for_task = root.clone();
+        let task = tokio::spawn(async move {
+            handle_connection_at(
+                server,
+                Arc::from(root_for_task.as_path()),
+                root_for_task.clone(),
+                false,
+                deadline,
+            )
+            .await;
+        });
+        let body = r#"{"recipient":"worker","type":"task.assigned","task_id":5,"event_seq":7}"#;
+        client
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        task.await.unwrap();
+        tokio::task::spawn_blocking(move || host.join().unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn http_acknowledges_only_host_acceptance() {
+        let response = http_delivery_case(
+            true,
+            false,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let response = http_delivery_case(
+            false,
+            false,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"));
+    }
+
+    #[tokio::test]
+    async fn retries_once_with_original_identity() {
+        let response = http_delivery_case(
+            false,
+            true,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn slow_host_is_reported_as_retriable_failure() {
+        let response = http_delivery_case(
+            true,
+            false,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"));
+    }
+
+    #[test]
+    fn managed_wake_sends_one_json_frame_and_requires_acceptance() {
+        use std::io::{BufRead, Write};
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "fleet-notify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("worker")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.join("worker/control.sock")).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                serde_json::json!({"prompt":"line one\nline two"})
+            );
+            stream.write_all(b"{\"ok\":true}\n").unwrap();
+        });
+        session_inject(&root, "worker", "line one\nline two").unwrap();
+        host.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_control_rejects_path_escape_and_absent_host() {
+        assert!(session_inject(std::path::Path::new("/tmp"), "../escape", "wake").is_err());
+        assert!(session_interrupt(std::path::Path::new("/no-such-fleet-root"), "worker").is_err());
+    }
+
+    #[test]
+    fn managed_interrupt_propagates_host_rejection() {
+        use std::io::{BufRead, Write};
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "fleet-interrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("worker")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.join("worker/control.sock")).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                serde_json::json!({"interrupt":true})
+            );
+            stream
+                .write_all(b"{\"ok\":false,\"error\":\"busy\"}\n")
+                .unwrap();
+        });
         assert!(
-            steps[..first_enter].contains(&InjectStep::Settle),
-            "a settle precedes the first Enter so the paste has committed"
+            session_interrupt(&root, "worker")
+                .unwrap_err()
+                .contains("rejected")
         );
-        // Two Enters submit: the second is the belt-and-suspenders that lands a codex wake if the first raced,
-        // and is a no-op at claude's (now-empty) composer — so a claude wake still fires exactly once.
-        assert_eq!(
-            steps.iter().filter(|s| **s == InjectStep::Enter).count(),
-            2,
-            "double-Enter submit"
-        );
-        // The very last step is an Enter (the submit), never a trailing settle.
-        assert_eq!(steps.last(), Some(&InjectStep::Enter));
+        host.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -130,6 +130,11 @@ fn default_path() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".config/fleet/config.toml"))
 }
 
+/// Carry the selected configuration into managed child session hosts.
+pub fn current_path() -> Option<PathBuf> {
+    PATH_OVERRIDE.get().cloned().flatten().or_else(default_path)
+}
+
 /// Record the `--config <path>` override before the first [`get`]. A no-op once the config is loaded.
 pub fn set_path(path: Option<PathBuf>) {
     let _ = PATH_OVERRIDE.set(path);
