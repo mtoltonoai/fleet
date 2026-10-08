@@ -1,0 +1,33 @@
+# `bridge-core` — the transport-agnostic core shared by every board↔external-channel bridge.
+#
+# Extracted from `slack-bridge` (task #342) once the Slack (#312/Doc #13) and voice (#316/Doc #18)
+# bridge designs converged on one contract. A "bridge" = this core + a per-transport layer:
+#   - bridge-core (here): the board REST client (firehose poll / attributed post / external-identity),
+#     the PURE bidirectional sync planners (plan_inbound / plan_outbound, resolver injected as a closure),
+#     the board↔external channel MAP, and the relay-resilience escalation. All source-agnostic.
+#   - the transport (per crate): how the external side is reached + rendered — Slack Socket Mode + mrkdwn
+#     (crates/slack-bridge), audio wake→STT / synth→play (the voice bridge, #316), etc.
+#
+# Consumers today: slack-bridge + the voice bridge, both workspace members. A workspace crate (not
+# crates.io-published) — the downstream whole-channel bridge (#312) went self-contained in its own build, so no
+# external publish is needed; publishing stays an additive later step if a downstream consumer ever wants it.
+[package]
+name = "bridge-core"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "bridge_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Async HTTP client for the board's token-less localhost REST surface (GET /events firehose poll,
+# POST /channels/:id/posts, /external-links, /external-identities). Async by design (operator directive
+# #370: tokio, not a thread-per-blocking-call model) — the BoardClient methods are `async fn`; the caller
+# provides the runtime. The PURE planners (plan_inbound/plan_outbound/ChannelMap/relay_plan) stay sync.
+# rustls (no OpenSSL); no default TLS backend pulled.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

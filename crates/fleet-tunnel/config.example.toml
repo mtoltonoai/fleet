@@ -1,0 +1,61 @@
+# fleet-tunnel daemon config — copy, edit, and pass with `--config` (no env vars, mandate #159).
+
+# REQUIRED. The board websocket URL to dial. The board is mounted under /board, so the WS
+# endpoint is /board/tunnel/ws (plain /tunnel/ws is the edge landing page — the upgrade fails there).
+#   off-LAN via local Caddy (recommended on a remote dev host): "ws://127.0.0.1:8880/board/tunnel/ws"
+#       — a local Caddy proxy on :8880 injects the CF Access headers and forwards to green, so
+#         leave cf_client_* UNSET (Caddy does the auth).
+#   off-LAN direct to the public gateway:               "wss://green-machine.camshaft.dev/board/tunnel/ws"
+#       — set cf_client_* below (you present the CF Access service token yourself).
+#   on-LAN direct to the board:                         "ws://green-machine.lan:8079/tunnel/ws"
+#       — no auth, no /board prefix (that prefix is the external gateway mount, stripped before the board).
+board_ws = "ws://127.0.0.1:8880/board/tunnel/ws"
+
+# This host's id in the hello frame. Defaults to the system hostname if omitted.
+# host_id = "dev-host"
+
+# Optional: DERIVE the served-agent set at each (re)connect instead of hand-maintaining `agents` below.
+# The command's stdout is read one agent id per line. `fleet served-set` prints exactly the board agents
+# that have a live tmux window on THIS host and aren't pinned elsewhere — so a moved/new agent picks up
+# event-wakes on the next reconnect with no config edit (a stale static list silently starves an agent).
+# On command failure or empty output the daemon falls back to the static `agents` list below.
+# agents_cmd = "fleet served-set"
+
+# With `agents_cmd`, also re-derive the served set on a LIVE connection every N seconds and, if it CHANGED,
+# reconnect to re-register — so a newly-spun or relocated agent starts getting event-wakes within ~N seconds
+# instead of waiting for an incidental reconnect (the gap that silently starved a just-moved agent). Default
+# 90s when `agents_cmd` is set; set to 0 to disable (refresh only at reconnect). Ignored without `agents_cmd`.
+# served_refresh_secs = 90
+
+# Agent ids whose loops run on this host. The board keys live tunnels by this set and routes each
+# agent's wakes down the matching socket. Used verbatim unless `agents_cmd` (above) yields a set.
+agents = [
+  "board-pm",
+  "fleet-tunnel",
+  "v-backbeat",
+  "v-bolero",
+  "v-capmeshd",
+  "v-fleet-tooling",
+  "v-nmidid",
+  "v-surfaced",
+  "v-task-board",
+]
+
+# Local upstream the daemon forwards board requests to (the notifier). Default shown.
+# upstream = "http://127.0.0.1:8899"
+
+# Optional per-host bearer sent in the hello frame.
+# token = ""
+
+# Optional health/liveness probe. When set, the daemon serves a tiny loopback HTTP endpoint that
+# reports {board_ws, last_board_frame_age_secs, upstream_reachable, ok} as JSON (HTTP 200 when the
+# wake path is live, 503 otherwise) so a watchdog can tell a working tunnel from a silently-wedged
+# socket — "process running" is not enough once wakes ride it. Unset = disabled (no inbound port).
+# Any request path returns the health JSON. Keep it loopback-only.
+# health_addr = "127.0.0.1:8898"
+
+# Cloudflare Access service token — set ONLY when dialing the public gateway DIRECTLY (off-LAN
+# without the local Caddy). Omit when using the local Caddy dial (it injects CF Access) or on the
+# LAN path. Keep the real values out of git.
+# cf_client_id = ""
+# cf_client_secret = ""

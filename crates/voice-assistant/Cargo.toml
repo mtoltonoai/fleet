@@ -1,0 +1,61 @@
+# `voice-assistant` — a local voice loop: custom wake phrase → STT → Claude (+ MCP knowledge base /
+# task board / surfaces) → TTS, spoken through the host's audio. Ported to Rust from the Python
+# `shop-assistant` (operator seq-1375/1376: push it into a repo + flake, and it must be Rust).
+#
+# Same layout as `fleet-tunnel` / `slack-bridge`: the pure, synchronously-testable core (config parse,
+# chime tone math, board reply rendering + the OUTBOUND reply planner) is a lib the workspace
+# `cargo test` / `nix flake check` always gates. The heavy ML + audio tree (sherpa-onnx for STT/TTS/
+# wake, cpal for capture/playback, the tokio-driven board session) is deferred behind a `runtime` feature
+# so the default build stays light and the binary that needs the native/GPU libs is opt-in.
+[package]
+name = "voice-assistant"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "voice_assistant"
+path = "src/lib.rs"
+
+# The daemon binary — the audio+ML shell. `required-features = ["runtime"]`-gated so the default
+# `cargo test --workspace` / `nix flake check` never builds sherpa-onnx or cpal.
+[[bin]]
+name = "voice-assistant"
+path = "src/main.rs"
+required-features = ["runtime"]
+
+[features]
+# The live voice loop: pulls the ONNX backend (sherpa-onnx: STT/TTS/wake) + audio I/O (cpal). Off by
+# default; enable to build/run the daemon.
+runtime = ["dep:sherpa-onnx", "dep:cpal", "dep:clap", "dep:signal-hook", "dep:tokio"]
+
+[dependencies]
+# The transport-agnostic bridge core (board REST client, pure sync planners, channel map, relay
+# resilience), shared with slack-bridge (#342). The voice bridge (#316) reuses its board contract; the
+# voice-specific parts (render-to-TTS-text, the audio loop) sit above it in `src/bridge` + `runtime`.
+bridge-core = { path = "../bridge-core" }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: the brain forwards MCP tool arguments straight through; don't reorder object keys.
+serde_json = { version = "1", features = ["preserve_order"] }
+# The config format: a single TOML file (operator mandate seq-1377 — no env-var config).
+toml = "0.8"
+
+# ── The runtime tree — OPTIONAL, pulled only by the `runtime` feature (see above). ──
+# The single ONNX backend: STT (Whisper, CUDA), TTS (Kokoro), wake (KWS). Official k2-fsa bindings
+# (the `shared` feature links a prebuilt libsherpa-onnx — a CUDA 11.8 GPU build on green-machine, which
+# runs on the Pascal 1080 Ti; the default `static` links the bundled CPU archive).
+sherpa-onnx = { version = "1.13", optional = true, default-features = false, features = ["shared"] }
+# Microphone capture + speaker playback (ALSA/PipeWire on Linux).
+cpal = { version = "0.15", optional = true }
+# `--config <path>` CLI flag (the ONLY thing chosen outside the TOML file; mandate seq-1377).
+clap = { version = "4", features = ["derive"], optional = true }
+# Graceful SIGTERM/SIGINT shutdown: break the loop and RETURN so the cpal capture stream drops
+# (snd_pcm_close releases the ALSA device) before the process exits, instead of the default abrupt
+# terminate. A slow old instance that still holds the device makes the next one storm errno -32 on a
+# deploy restart (#239, green-machine-ops). No thread — it installs a plain sigaction flag.
+signal-hook = { version = "0.3", optional = true }
+# The runtime the loop drives the async bridge-core BoardClient on (operator directive #370: the shared
+# core is async/tokio, not thread-per-blocking-call). A current-thread runtime is enough — the loop calls
+# block_on sequentially, no spawned tasks; `net` + `time` give reqwest its IO + timers.
+tokio = { version = "1", features = ["rt", "net", "time"], optional = true }

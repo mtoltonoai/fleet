@@ -1,0 +1,4 @@
+# Local/dev config (holds credentials) — NEVER commit. In deploy the daemon reads its TOML config from
+# the agenix-decrypted secret (task #153); no env-var config anywhere (operator mandate #159).
+/slack-bridge.toml
+/slack.toml

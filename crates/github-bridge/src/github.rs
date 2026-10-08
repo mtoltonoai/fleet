@@ -1,0 +1,698 @@
+//! `github` — the GitHub REST API transport: the issue/comment domain model, pure parsers, and a thin
+//! authenticated client for polling a repo's issues + comments.
+//!
+//! This is the OTHER end of the bridge from [`crate::board`]: the board client reads/writes the coordination
+//! board; this client reads GitHub. GitHub is plain REST polling (no webhooks/streaming needed for the fleet
+//! use), so the whole adapter stays a blocking poll loop with no heavy async tree — unlike Slack's Socket
+//! Mode. All PARSING is factored into pure functions ([`parse_issues`], [`parse_issue_comments`]) that are
+//! unit-tested against captured GitHub JSON without a network; the HTTP methods are thin ureq wrappers
+//! exercised live by the daemon (a later slice).
+//!
+//! The client is transport only: it does NOT decide what to ingest or how to map issues to tasks — that is
+//! the sync planner's job (a later slice), kept separate so the mapping stays pure + testable and the GitHub
+//! specifics stay confined to this module.
+
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::Value;
+
+/// GitHub's max page size for list endpoints. The poll loop pages until a page returns fewer than this.
+pub const PER_PAGE: usize = 100;
+
+/// The GitHub REST API version this adapter pins (sent as `X-GitHub-Api-Version`). Pinning avoids silent
+/// breakage when GitHub advances the default version.
+const API_VERSION: &str = "2022-11-28";
+
+/// The external-identity prefix for a GitHub user: a stable `github:<login>` key the board attributes an
+/// ingested author with (board-core #149), so board readers see the GitHub author, not the bridge.
+pub fn github_external_author(login: &str) -> String {
+    format!("github:{login}")
+}
+
+/// A GitHub issue, reduced to the fields ingest needs. Note the GitHub issues list endpoint also returns
+/// PULL REQUESTS (a PR is an issue with a `pull_request` object); [`Issue::is_pull_request`] flags them so
+/// ingest can skip PRs and mirror only real issues.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue {
+    /// The issue number within its repo (the `#N` users see; stable, unlike the internal id).
+    pub number: i64,
+    pub title: String,
+    /// The issue body (Markdown). Empty string when GitHub returns `null` (an issue with no description).
+    pub body: String,
+    /// `"open"` or `"closed"`.
+    pub state: String,
+    /// The author's GitHub login, or empty when the account is gone ("ghost").
+    pub author: String,
+    /// RFC3339 last-updated timestamp — the poll cursor (`?since=`) and staleness check.
+    pub updated_at: String,
+    /// The issue's web URL (for a human-legible back-reference on the mirrored task).
+    pub html_url: String,
+    /// True when this "issue" is actually a pull request (has a `pull_request` object). Issue ingest skips
+    /// these; the PR-review sync (BUILD 2) mirrors them instead.
+    pub is_pull_request: bool,
+    /// For a PR row, the `pull_request.merged_at` RFC3339 timestamp — `Some` iff the PR was merged, `None`
+    /// for an open or closed-unmerged PR (and always `None` for a real issue). The issues-list endpoint
+    /// includes this on the nested `pull_request` object, so the merged/closed distinction needs no extra
+    /// GitHub call (BUILD 2a: "no new endpoints"). See [`crate::sync::pr_review_status`].
+    pub pr_merged_at: Option<String>,
+}
+
+/// A comment on a GitHub issue, reduced to the fields the attributed-comment sync needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    /// GitHub's globally-unique comment id — the stable dedup/link key (an issue's comments share the issue
+    /// number, so the comment id is what identifies a comment).
+    pub id: i64,
+    pub body: String,
+    /// The commenter's GitHub login, or empty for a ghost account.
+    pub author: String,
+    /// RFC3339 last-updated timestamp — the per-issue comment poll cursor.
+    pub updated_at: String,
+    pub html_url: String,
+}
+
+/// A GitHub pull request from the Pulls API (`GET /repos/{repo}/pulls/{number}`) — richer than the
+/// issues-list row: it carries `draft` and a definitive `merged` flag, which BUILD 2b needs to distinguish
+/// draft / in-review / changes-requested / approved / closed. Reduced to the fields the status refinement uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: i64,
+    /// `"open"` or `"closed"`.
+    pub state: String,
+    /// True while the PR is a draft (not yet ready for review).
+    pub draft: bool,
+    /// True once the PR has been merged (definitive, unlike the issues-list `pull_request.merged_at`).
+    pub merged: bool,
+}
+
+/// A review on a pull request from the Reviews API (`GET /repos/{repo}/pulls/{number}/reviews`). `state` is
+/// GitHub's review verdict: `APPROVED` / `CHANGES_REQUESTED` / `COMMENTED` / `DISMISSED` / `PENDING`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullReview {
+    pub id: i64,
+    /// The review verdict (uppercase GitHub enum; empty if absent).
+    pub state: String,
+    /// The reviewer's login, or empty for a ghost.
+    pub author: String,
+    /// RFC3339 submission time — orders reviews so the latest decisive verdict wins.
+    pub submitted_at: String,
+}
+
+/// An inline diff-review comment on a pull request from the Review Comments API
+/// (`GET /repos/{repo}/pulls/{number}/comments`, BUILD 2b-2) — a comment attached to a specific file + line
+/// of the diff, distinct from a PR *conversation* comment (which is an [`IssueComment`]). Mirrored into the
+/// review log as a `finding`-type entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    /// GitHub's globally-unique review-comment id — the dedup/link key (its own id space, `#rc<id>`).
+    pub id: i64,
+    pub body: String,
+    /// The commenter's GitHub login, or empty for a ghost account.
+    pub author: String,
+    /// The file path the inline comment targets (empty if absent).
+    pub path: String,
+    /// The diff line the comment targets, when present (`null` for an outdated/collapsed comment).
+    pub line: Option<i64>,
+    /// RFC3339 last-updated timestamp — the incremental poll cursor.
+    pub updated_at: String,
+}
+
+/// The nested `user` object on issues/comments. Login is optional (a deleted account serializes as `null`).
+#[derive(Deserialize)]
+struct RawUser {
+    #[serde(default)]
+    login: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawIssue {
+    number: i64,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    /// Present iff this row is a pull request. Presence flags a PR; `merged_at` (nested) distinguishes a
+    /// merged PR from an open/closed-unmerged one.
+    #[serde(default)]
+    pull_request: Option<RawPullRequest>,
+}
+
+/// The nested `pull_request` object on a PR row of the issues-list response. Only `merged_at` matters here
+/// (its presence is the PR flag; the timestamp is the merged/unmerged distinction).
+#[derive(Deserialize)]
+struct RawPullRequest {
+    #[serde(default)]
+    merged_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawComment {
+    id: i64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPull {
+    number: i64,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    draft: Option<bool>,
+    #[serde(default)]
+    merged: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RawReview {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    submitted_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawReviewComment {
+    id: i64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<RawUser>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    line: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+fn login_of(user: Option<RawUser>) -> String {
+    user.and_then(|u| u.login).unwrap_or_default()
+}
+
+/// Pull the JSON array out of a GitHub list response. The list endpoints return a BARE array; the search API
+/// wraps it in `{ "items": [...] }`. Accept both (and an `{ "issues"/"comments": [...] }` envelope) so a
+/// caller that swaps endpoints later doesn't break. Returns the parse error text on a non-array body.
+fn list_array(body: &str, what: &str) -> Result<Vec<Value>, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("github {what}: response was not JSON: {e}"))?;
+    match v {
+        Value::Array(a) => Ok(a),
+        Value::Object(ref o) => o
+            .get("items")
+            .or_else(|| o.get(what))
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| format!("github {what}: object without an array field: {v}")),
+        other => Err(format!("github {what}: expected an array, got {other}")),
+    }
+}
+
+/// Parse a GitHub issues-list response into [`Issue`]s. Null bodies become `""`; a missing/null author
+/// becomes `""`; a row with a `pull_request` object is flagged (not filtered — the caller decides). Never
+/// panics on a well-formed-but-sparse row.
+pub fn parse_issues(body: &str) -> Result<Vec<Issue>, String> {
+    let arr = list_array(body, "issues")?;
+    arr.into_iter()
+        .map(|row| {
+            let r: RawIssue =
+                serde_json::from_value(row).map_err(|e| format!("github issues: bad row: {e}"))?;
+            let pr_merged_at = r.pull_request.as_ref().and_then(|pr| pr.merged_at.clone());
+            Ok(Issue {
+                number: r.number,
+                title: r.title.unwrap_or_default(),
+                body: r.body.unwrap_or_default(),
+                state: r.state.unwrap_or_default(),
+                author: login_of(r.user),
+                updated_at: r.updated_at.unwrap_or_default(),
+                html_url: r.html_url.unwrap_or_default(),
+                is_pull_request: r.pull_request.is_some(),
+                pr_merged_at,
+            })
+        })
+        .collect()
+}
+
+/// Parse a GitHub issue-comments-list response into [`IssueComment`]s. Same null-tolerance as
+/// [`parse_issues`].
+pub fn parse_issue_comments(body: &str) -> Result<Vec<IssueComment>, String> {
+    let arr = list_array(body, "comments")?;
+    arr.into_iter()
+        .map(|row| {
+            let r: RawComment = serde_json::from_value(row)
+                .map_err(|e| format!("github comments: bad row: {e}"))?;
+            Ok(IssueComment {
+                id: r.id,
+                body: r.body.unwrap_or_default(),
+                author: login_of(r.user),
+                updated_at: r.updated_at.unwrap_or_default(),
+                html_url: r.html_url.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a single GitHub pull request (`GET /repos/{repo}/pulls/{number}`, a JSON object) into a
+/// [`PullRequest`]. Null-tolerant: a missing `draft`/`merged` defaults to `false`, a missing `state` to `""`.
+/// (BUILD 2b.)
+pub fn parse_pull_request(body: &str) -> Result<PullRequest, String> {
+    let r: RawPull =
+        serde_json::from_str(body).map_err(|e| format!("github pull: bad response shape: {e}"))?;
+    Ok(PullRequest {
+        number: r.number,
+        state: r.state.unwrap_or_default(),
+        draft: r.draft.unwrap_or(false),
+        merged: r.merged.unwrap_or(false),
+    })
+}
+
+/// Parse a GitHub pull-request-reviews response (`GET /repos/{repo}/pulls/{number}/reviews`) into
+/// [`PullReview`]s. Same null-tolerance + bare-array/`items`-envelope handling as [`parse_issues`]. (BUILD 2b.)
+pub fn parse_pull_reviews(body: &str) -> Result<Vec<PullReview>, String> {
+    let arr = list_array(body, "reviews")?;
+    arr.into_iter()
+        .map(|row| {
+            let r: RawReview =
+                serde_json::from_value(row).map_err(|e| format!("github reviews: bad row: {e}"))?;
+            Ok(PullReview {
+                id: r.id,
+                state: r.state.unwrap_or_default(),
+                author: login_of(r.user),
+                submitted_at: r.submitted_at.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// Parse a GitHub pull-request review-comments response (`GET /repos/{repo}/pulls/{number}/comments`) into
+/// [`ReviewComment`]s (inline diff findings, BUILD 2b-2). Same null-tolerance + bare-array/`items`-envelope
+/// handling as [`parse_issues`].
+pub fn parse_pull_review_comments(body: &str) -> Result<Vec<ReviewComment>, String> {
+    let arr = list_array(body, "comments")?;
+    arr.into_iter()
+        .map(|row| {
+            let r: RawReviewComment = serde_json::from_value(row)
+                .map_err(|e| format!("github review-comments: bad row: {e}"))?;
+            Ok(ReviewComment {
+                id: r.id,
+                body: r.body.unwrap_or_default(),
+                author: login_of(r.user),
+                path: r.path.unwrap_or_default(),
+                line: r.line,
+                updated_at: r.updated_at.unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// A thin authenticated GitHub REST client (ASYNC, over reqwest — operator directive: no blocking IO; the
+/// caller provides the tokio runtime). Holds the token; NO `Debug` derive so the credential can't leak via a
+/// stray `{:?}`.
+pub struct GithubClient {
+    api_base: String,
+    token: String,
+    http: Client,
+}
+
+impl GithubClient {
+    /// Build a client against `api_base` (public GitHub `https://api.github.com`, or a GHES base) with the
+    /// given token. A trailing slash on `api_base` is trimmed so path joins don't double up. No network
+    /// round-trip (the reqwest `Client` constructs without a runtime).
+    pub fn new(api_base: &str, token: &str) -> Self {
+        GithubClient {
+            api_base: api_base.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            http: Client::new(),
+        }
+    }
+
+    /// Apply the auth + versioning + User-Agent headers GitHub requires on every request (a missing
+    /// User-Agent is a hard 403). Shared by the GET + POST paths.
+    fn headers(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        rb.header("authorization", format!("Bearer {}", self.token))
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", API_VERSION)
+            .header("user-agent", "github-bridge")
+    }
+
+    /// GET a path (already query-formed), returning the raw response body. Errors on a non-2xx (via
+    /// `error_for_status`, matching the prior blocking behavior) so the caller can retry.
+    async fn get(&self, path: &str) -> Result<String, String> {
+        self.headers(self.http.get(format!("{}{}", self.api_base, path)))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("github GET {path} failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("github GET {path} read failed: {e}"))
+    }
+
+    /// Post a comment on an issue (`POST /repos/{repo}/issues/{number}/comments`) — the OUT direction, where
+    /// `repo` = `owner/name`. Body is the rendered reflect text. Returns the new comment's id (best-effort;
+    /// `0` if the response omits it). Errors on a non-2xx (the daemon then leaves its cursor unadvanced so
+    /// the reflect retries).
+    pub async fn post_issue_comment(
+        &self,
+        repo: &str,
+        number: i64,
+        body: &str,
+    ) -> Result<i64, String> {
+        let url = format!("{}/repos/{repo}/issues/{number}/comments", self.api_base);
+        let payload = serde_json::json!({ "body": body }).to_string();
+        let raw = self
+            .headers(self.http.post(&url))
+            .header("content-type", "application/json")
+            .body(payload)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| format!("github POST issue {repo}#{number} comment failed: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("github POST comment read failed: {e}"))?;
+        Ok(serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|v| v.get("id").and_then(Value::as_i64))
+            .unwrap_or(0))
+    }
+
+    /// One page of a repo's issues (`repo` = `owner/name`), oldest-updated first so a cursor advances
+    /// monotonically. `state=all` (open + closed). `since` (RFC3339) filters to issues updated at/after it —
+    /// the incremental poll cursor. `page` is 1-based. NOTE: the result may include pull requests (flagged
+    /// via [`Issue::is_pull_request`]); ingest filters them.
+    pub async fn list_issues(
+        &self,
+        repo: &str,
+        since: Option<&str>,
+        page: usize,
+    ) -> Result<Vec<Issue>, String> {
+        let mut path = format!(
+            "/repos/{repo}/issues?state=all&sort=updated&direction=asc&per_page={PER_PAGE}&page={page}"
+        );
+        if let Some(s) = since {
+            path.push_str("&since=");
+            path.push_str(s);
+        }
+        parse_issues(&self.get(&path).await?)
+    }
+
+    /// The authenticated account's own login (`GET /user` → `login`). The daemon fetches this once at
+    /// startup so `sync::plan_comment_ingest` can skip comments the bridge itself posted (loop-safety: an
+    /// OUT-reflected comment must not re-ingest). Best-effort at the call site — a GitHub App installation
+    /// token may 403 on `/user`; the daemon then runs with no self-login (dedup still guards re-posts).
+    pub async fn viewer_login(&self) -> Result<String, String> {
+        let raw = self.get("/user").await?;
+        let v: Value =
+            serde_json::from_str(&raw).map_err(|e| format!("github GET /user: not JSON: {e}"))?;
+        v.get("login")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("github GET /user: no login in response {v}"))
+    }
+
+    /// Fetch a single pull request (`GET /repos/{repo}/pulls/{number}`, BUILD 2b) — the richer PR view with
+    /// `draft` + a definitive `merged` flag that the issues-list row lacks. `repo` = `owner/name`.
+    pub async fn get_pull(&self, repo: &str, number: i64) -> Result<PullRequest, String> {
+        parse_pull_request(&self.get(&format!("/repos/{repo}/pulls/{number}")).await?)
+    }
+
+    /// One page of a pull request's reviews (`GET /repos/{repo}/pulls/{number}/reviews`, BUILD 2b), oldest
+    /// first (GitHub returns them in submission order). `page` is 1-based.
+    pub async fn list_pull_reviews(
+        &self,
+        repo: &str,
+        number: i64,
+        page: usize,
+    ) -> Result<Vec<PullReview>, String> {
+        let path = format!("/repos/{repo}/pulls/{number}/reviews?per_page={PER_PAGE}&page={page}");
+        parse_pull_reviews(&self.get(&path).await?)
+    }
+
+    /// One page of a pull request's inline diff-review comments (`GET /repos/{repo}/pulls/{number}/comments`,
+    /// BUILD 2b-2), oldest-updated first. `since` (RFC3339) filters incrementally. `page` is 1-based. NOTE:
+    /// distinct from [`list_issue_comments`](Self::list_issue_comments) — those are the PR's *conversation*
+    /// comments; these are the *diff* comments mirrored as review findings.
+    pub async fn list_pull_review_comments(
+        &self,
+        repo: &str,
+        number: i64,
+        since: Option<&str>,
+        page: usize,
+    ) -> Result<Vec<ReviewComment>, String> {
+        let mut path = format!(
+            "/repos/{repo}/pulls/{number}/comments?sort=updated&direction=asc&per_page={PER_PAGE}&page={page}"
+        );
+        if let Some(s) = since {
+            path.push_str("&since=");
+            path.push_str(s);
+        }
+        parse_pull_review_comments(&self.get(&path).await?)
+    }
+
+    /// One page of an issue's comments, oldest-updated first. `since` filters incrementally. `page` 1-based.
+    pub async fn list_issue_comments(
+        &self,
+        repo: &str,
+        issue_number: i64,
+        since: Option<&str>,
+        page: usize,
+    ) -> Result<Vec<IssueComment>, String> {
+        let mut path =
+            format!("/repos/{repo}/issues/{issue_number}/comments?per_page={PER_PAGE}&page={page}");
+        if let Some(s) = since {
+            path.push_str("&since=");
+            path.push_str(s);
+        }
+        parse_issue_comments(&self.get(&path).await?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_external_author_is_stable_prefix() {
+        assert_eq!(github_external_author("octocat"), "github:octocat");
+    }
+
+    // ── parse_issues ───────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_issues_maps_the_fields() {
+        // A trimmed real GitHub issues-list row.
+        let body = r#"[
+            {"number": 42, "title": "Fix the widget", "body": "it's broken",
+             "state": "open", "user": {"login": "octocat"},
+             "updated_at": "2026-09-29T10:00:00Z", "html_url": "https://github.com/o/r/issues/42"}
+        ]"#;
+        let issues = parse_issues(body).unwrap();
+        assert_eq!(issues.len(), 1);
+        let i = &issues[0];
+        assert_eq!(i.number, 42);
+        assert_eq!(i.title, "Fix the widget");
+        assert_eq!(i.body, "it's broken");
+        assert_eq!(i.state, "open");
+        assert_eq!(i.author, "octocat");
+        assert_eq!(i.updated_at, "2026-09-29T10:00:00Z");
+        assert_eq!(i.html_url, "https://github.com/o/r/issues/42");
+        assert!(!i.is_pull_request);
+    }
+
+    #[test]
+    fn parse_issues_flags_pull_requests() {
+        // The issues endpoint returns PRs too — they carry a `pull_request` object. Flag, don't drop.
+        let body = r#"[
+            {"number": 7, "title": "a PR", "state": "open", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u", "pull_request": {"url": "..."}},
+            {"number": 8, "title": "a real issue", "state": "open", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u"}
+        ]"#;
+        let issues = parse_issues(body).unwrap();
+        assert!(
+            issues[0].is_pull_request,
+            "row with pull_request is flagged"
+        );
+        assert!(!issues[1].is_pull_request, "row without is a real issue");
+        assert_eq!(
+            issues[1].pr_merged_at, None,
+            "a real issue has no merged_at"
+        );
+    }
+
+    #[test]
+    fn parse_issues_reads_pull_request_merged_at() {
+        // The issues-list `pull_request` object carries merged_at (null until merged) — 2a needs no extra
+        // fetch to tell a merged PR from a closed-unmerged one.
+        let body = r#"[
+            {"number": 10, "title": "merged PR", "state": "closed", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u",
+             "pull_request": {"url": "...", "merged_at": "2026-09-30T00:00:00Z"}},
+            {"number": 11, "title": "open PR", "state": "open", "user": {"login": "dev"},
+             "updated_at": "t", "html_url": "u", "pull_request": {"url": "...", "merged_at": null}}
+        ]"#;
+        let issues = parse_issues(body).unwrap();
+        assert!(issues[0].is_pull_request);
+        assert_eq!(
+            issues[0].pr_merged_at.as_deref(),
+            Some("2026-09-30T00:00:00Z")
+        );
+        assert!(issues[1].is_pull_request);
+        assert_eq!(
+            issues[1].pr_merged_at, None,
+            "null merged_at → None (open/unmerged PR)"
+        );
+    }
+
+    #[test]
+    fn parse_issues_tolerates_null_body_and_ghost_author() {
+        let body = r#"[
+            {"number": 1, "title": "no body", "body": null, "state": "closed",
+             "user": null, "updated_at": "t", "html_url": "u"}
+        ]"#;
+        let i = &parse_issues(body).unwrap()[0];
+        assert_eq!(i.body, "", "null body → empty string");
+        assert_eq!(i.author, "", "null/ghost user → empty author");
+        assert_eq!(i.state, "closed");
+    }
+
+    #[test]
+    fn parse_issues_accepts_search_items_envelope() {
+        // The search API wraps rows in {items:[...]}; accept it so a caller can swap endpoints.
+        let body = r#"{"total_count": 1, "items": [
+            {"number": 5, "title": "t", "state": "open", "user": {"login": "u"},
+             "updated_at": "t", "html_url": "h"}]}"#;
+        let issues = parse_issues(body).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 5);
+    }
+
+    #[test]
+    fn parse_issues_empty_and_errors() {
+        assert!(parse_issues("[]").unwrap().is_empty());
+        assert!(parse_issues(r#"{"nope": 1}"#).is_err());
+        assert!(parse_issues("not json").is_err());
+    }
+
+    // ── parse_issue_comments ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_comments_maps_the_fields() {
+        let body = r#"[
+            {"id": 555, "body": "looks good", "user": {"login": "hubot"},
+             "updated_at": "2026-09-29T11:00:00Z", "html_url": "https://github.com/o/r/issues/42#c555"}
+        ]"#;
+        let cs = parse_issue_comments(body).unwrap();
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].id, 555);
+        assert_eq!(cs[0].body, "looks good");
+        assert_eq!(cs[0].author, "hubot");
+        assert_eq!(cs[0].updated_at, "2026-09-29T11:00:00Z");
+    }
+
+    #[test]
+    fn parse_comments_tolerates_null_body_and_ghost() {
+        let body = r#"[{"id": 1, "body": null, "user": null, "updated_at": "t", "html_url": "u"}]"#;
+        let c = &parse_issue_comments(body).unwrap()[0];
+        assert_eq!(c.body, "");
+        assert_eq!(c.author, "");
+    }
+
+    #[test]
+    fn parse_comments_empty_and_errors() {
+        assert!(parse_issue_comments("[]").unwrap().is_empty());
+        assert!(parse_issue_comments(r#"{"x": 1}"#).is_err());
+    }
+
+    // ── parse_pull_request / parse_pull_reviews (BUILD 2b) ─────────────────────────────────────────
+
+    #[test]
+    fn parse_pull_request_maps_draft_state_merged() {
+        let body = r#"{"number": 88, "state": "open", "draft": true, "merged": false,
+                       "title": "wip", "body": "..."}"#;
+        let pr = parse_pull_request(body).unwrap();
+        assert_eq!(pr.number, 88);
+        assert_eq!(pr.state, "open");
+        assert!(pr.draft);
+        assert!(!pr.merged);
+    }
+
+    #[test]
+    fn parse_pull_request_defaults_missing_flags_false() {
+        // A ready, unmerged open PR often omits draft/merged entirely.
+        let pr = parse_pull_request(r#"{"number": 5, "state": "open"}"#).unwrap();
+        assert!(!pr.draft, "missing draft -> false");
+        assert!(!pr.merged, "missing merged -> false");
+    }
+
+    #[test]
+    fn parse_pull_request_errors_on_non_object() {
+        assert!(parse_pull_request("not json").is_err());
+    }
+
+    #[test]
+    fn parse_pull_reviews_maps_verdict_author_time() {
+        let body = r#"[
+            {"id": 1, "state": "COMMENTED", "user": {"login": "octocat"}, "submitted_at": "2026-09-30T01:00:00Z"},
+            {"id": 2, "state": "CHANGES_REQUESTED", "user": {"login": "hubot"}, "submitted_at": "2026-09-30T02:00:00Z"}
+        ]"#;
+        let rs = parse_pull_reviews(body).unwrap();
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[1].id, 2);
+        assert_eq!(rs[1].state, "CHANGES_REQUESTED");
+        assert_eq!(rs[1].author, "hubot");
+        assert_eq!(rs[1].submitted_at, "2026-09-30T02:00:00Z");
+    }
+
+    #[test]
+    fn parse_pull_reviews_tolerates_ghost_and_empty() {
+        let body = r#"[{"id": 3, "state": "APPROVED", "user": null, "submitted_at": "t"}]"#;
+        let r = &parse_pull_reviews(body).unwrap()[0];
+        assert_eq!(r.author, "", "null reviewer -> empty");
+        assert!(parse_pull_reviews("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_pull_review_comments_maps_path_line_author() {
+        let body = r#"[
+            {"id": 900, "body": "off-by-one here", "user": {"login": "octocat"},
+             "path": "src/lib.rs", "line": 42, "updated_at": "2026-09-30T04:00:00Z"},
+            {"id": 901, "body": "outdated", "user": null, "path": "src/x.rs", "line": null, "updated_at": "t"}
+        ]"#;
+        let cs = parse_pull_review_comments(body).unwrap();
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].id, 900);
+        assert_eq!(cs[0].body, "off-by-one here");
+        assert_eq!(cs[0].author, "octocat");
+        assert_eq!(cs[0].path, "src/lib.rs");
+        assert_eq!(cs[0].line, Some(42));
+        assert_eq!(cs[1].author, "", "null user -> empty");
+        assert_eq!(cs[1].line, None, "null line tolerated");
+        assert!(parse_pull_review_comments("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn client_new_trims_trailing_slash() {
+        let c = GithubClient::new("https://api.github.com/", "ghp_x");
+        assert_eq!(c.api_base, "https://api.github.com");
+    }
+}

@@ -1,0 +1,198 @@
+name: checks
+
+# The automated gate for camshaft/fleet. Agents self-merge PRs here with --admin, so a human/CI reviewer
+# is NOT in the loop -- this workflow is the safety net that catches a cross-crate compile/lint break
+# (e.g. a bridge-core struct field added without updating its slack-bridge/voice-assistant consumers -- a
+# real trunk-red that reached main uncaught before this existed) BEFORE it lands. It runs the SAME
+# workspace gate the self-merge flow runs locally, so "green locally" and "green in CI" agree.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# One in-flight run per ref; a new push cancels the stale one.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workspace:
+    name: clippy + test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # tmux is not preinstalled on the runner; a few crates' tests shell it (git is already present).
+      - name: Install tmux (some tests shell it)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      # The whole-workspace lint gate. --all-targets compiles every crate's lib + bins + TESTS, so a
+      # consumer that no longer matches a changed shared type fails here. Default features only: no native
+      # audio/ML deps are pulled (voice-assistant's sherpa/cpal shell is behind its `runtime` feature), so
+      # the runner needs no cmake/alsa. -D warnings matches the fleet self-merge gate (rustfmt is NOT gated).
+      - name: clippy (workspace, all targets, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (workspace)
+        run: cargo test --workspace
+
+  voice-assistant-runtime:
+    name: build (voice-assistant --features runtime)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # This build is slow (~4min, and often queued). It is a REQUIRED check, so the JOB must ALWAYS run
+      # and report a status — a `paths:`-skipped required check never posts and blocks the PR forever. So
+      # instead of skipping the job, we detect whether any file that can affect the runtime build changed
+      # and SHORT-CIRCUIT the nix build when none did. A fleet-crate-only PR (main.rs / board.rs edits that
+      # never touch voice-assistant, the flake, or the lockfile) then satisfies this check in seconds and
+      # merges on the fast `clippy + test` gate — the whole-workspace clippy already compiles voice-assistant's
+      # lib, so a cross-crate API break is still caught; only the native sherpa/cpal LINK path is skipped.
+      # (task_563: the check taxed every unrelated fleet-crate PR with minutes of poll-and-wait wall-clock.)
+      - name: Detect voice-assistant-relevant changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            relevant:
+              - 'crates/voice-assistant/**'
+              - 'crates/bridge-core/**'
+              - 'flake.nix'
+              - 'flake.lock'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/checks.yml'
+
+      # voice-assistant's `runtime` feature (sherpa-onnx STT/TTS/wake + cpal audio) links a prebuilt
+      # linux-x64 sherpa lib and needs cmake/alsa, so it is gated to x86_64-linux in flake.nix (checks +
+      # packages). The GHA `ubuntu-latest` runner IS x86_64, so this is the one CI-native path that can
+      # build it — without this job, no PR touching the runtime feature has any green build signal short
+      # of a manual x86_64 machine round-trip (see crates/voice-assistant's aarch64-owner gap).
+      - uses: DeterminateSystems/nix-installer-action@v23
+        if: steps.filter.outputs.relevant == 'true'
+
+      - name: nix build .#voice-assistant (runtime feature, hermetic sherpa lib)
+        if: steps.filter.outputs.relevant == 'true'
+        run: nix build .#voice-assistant --print-build-logs
+
+      - name: Skip (no voice-assistant-relevant changes)
+        if: steps.filter.outputs.relevant != 'true'
+        run: echo "No voice-assistant / flake / workspace-manifest changes on this PR; skipping the ~4min runtime build. The fast 'clippy + test (workspace)' job is the merge gate — it already compiles voice-assistant's lib, so a cross-crate break is still caught."
+
+  # Isolated builds of the feature-gated daemon crates (task_959). The `clippy + test (workspace)` job runs
+  # DEFAULT features only, and these crates gate their daemon binary behind `required-features` (slack-bridge
+  # `transport`, github-bridge `daemon`) — so the whole-workspace build NEVER compiles that daemon code or its
+  # heavy async tree, and a break in it reaches main uncaught (the exact gap task_959 names). Building each
+  # crate with `-p <crate>` (resolver v2, so features resolve for ONLY that crate's subgraph, not the workspace
+  # union) WITH its shipping feature compiles the daemon bin + its tests, so a feature-unification or
+  # daemon-code break fails HERE. kb is NOT listed: its default lib is already in the workspace build and its
+  # load-dynamic link path is covered by the `.#kb` nix package, the same way voice-assistant's runtime is.
+  daemon-crate-builds:
+    name: build (feature-gated daemon crates, isolated)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - crate: slack-bridge
+            features: transport
+          - crate: github-bridge
+            features: daemon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `-p <crate>` builds only this crate's dependency subgraph (resolver v2 → no workspace feature-union),
+      # and `--features <shipping feature>` satisfies the bin's `required-features` so the daemon code compiles.
+      - name: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} (isolated, all targets)
+        run: cargo check -p ${{ matrix.crate }} --features ${{ matrix.features }} --all-targets
+
+  # task_782 ITEM 1 (commit-content guardrail): the PUBLIC-SAFE always-on layer of doc_104's hybrid design --
+  # a detect-secrets gate on every PR including forks. detect-secrets' default plugins carry no internal
+  # vocabulary, so this is the correct always-on layer on the untrusted (fork) path, where repo secrets are
+  # unavailable; the PRIVATE internal-marker layer (`fleet scan-content` against an Actions-secret taxonomy)
+  # runs only on trusted same-repo runs and is added once the operator provisions the secret (item-3). The job
+  # FAILS on any secret-shaped finding not already in the committed .secrets.baseline (the audited allowlist,
+  # which also carries the exclude-lines filter for nix SRI hashes). librarian owns the baseline + plugin
+  # config; it becomes the gate of record once the operator adds this check to the branch-protection required
+  # set (item-3).
+  content-guardrail:
+    name: content guardrail
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install detect-secrets
+        run: pip install detect-secrets
+
+      - name: detect-secrets gate (fail on a finding not in .secrets.baseline)
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys
+          BASELINE = ".secrets.baseline"
+          known = {(f, it["hashed_secret"])
+                   for f, items in json.load(open(BASELINE))["results"].items() for it in items}
+          # Re-scan against the committed baseline: detect-secrets applies its plugins + the baseline's
+          # exclude-lines filter (nix SRI hashes) and auto-excludes the baseline path; --exclude-files is a
+          # belt-and-suspenders so the allowlist file is never self-scanned. We compare by hashed_secret, so a
+          # baselined finding that merely MOVED lines is NOT a failure -- only a genuinely new secret-shaped
+          # string fails the gate.
+          subprocess.run(
+              ["detect-secrets", "scan", "--baseline", BASELINE, "--exclude-files", r"\.secrets\.baseline$"],
+              check=False, stdout=subprocess.DEVNULL,
+          )
+          new = [(f, it) for f, items in json.load(open(BASELINE))["results"].items()
+                 for it in items if (f, it["hashed_secret"]) not in known]
+          if new:
+              print("content guardrail: NEW secret-shaped finding(s) not in .secrets.baseline:")
+              for f, it in new:
+                  print(f"  {f}:{it.get('line_number')} [{it.get('type')}]")
+              print("If benign, audit + allowlist locally with:")
+              print("  detect-secrets scan --baseline .secrets.baseline && detect-secrets audit .secrets.baseline")
+              print("then commit the updated .secrets.baseline.")
+              sys.exit(1)
+          print("content guardrail: clean -- no secret-shaped findings beyond the audited baseline")
+          PY
+
+  # task_1319: the clean-prose gate. Comments in crates/fleet and the loops markdown must read as plain prose:
+  # no filler emphatics (matched against crates/fleet/prose-style.toml, a projection of the board
+  # banned-phrases list) and no caps-for-emphasis. The pre-existing findings are suppressed by
+  # crates/fleet/prose-style.baseline.json, so this fires only on a new comment finding; the baseline burns
+  # down in a later cleanup. The gate logic lives in the `fleet` binary, not a shell script (the no-bash
+  # directive). ft-nix extends THIS job with the clippy.toml disallowed-methods and `fleet lint-no-shell`
+  # steps for task_1318 -- one job, grown incrementally, not a parallel job.
+  tooling-gates:
+    name: tooling gates (clean-prose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fleet lint-prose (a new emphatic or caps-for-emphasis comment fails the gate)
+        run: >
+          cargo run -q -p fleet -- lint-prose
+          --ruleset crates/fleet/prose-style.toml
+          --dir crates/fleet --dir loops
+          --baseline crates/fleet/prose-style.baseline.json

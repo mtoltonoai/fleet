@@ -1,0 +1,34 @@
+# `fleet` — the standalone orchestrator binary. Every agent runs this (on PATH) for all comms; `fleet up`
+# reconciles a target repo's checked-in declared roster into running agents. See ../../DESIGN.md.
+# SCAFFOLD ONLY: this is the P1 skeleton (byte-identical-behavior lift of cadenza's fleet.rs lands
+# incrementally on top). No cadenza gate/build/corpus logic ever lands here (per the operator ruling —
+# core is messaging + window management + orchestration only).
+[package]
+name = "fleet"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fleet"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+# preserve_order: when we surgically add one trusted-project entry to the user's ~/.claude.json we must
+# NOT reorder the rest of their config (it is shared with every live claude session).
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+# Minimal blocking HTTP client for the orchestrator's read-only board access (MCP JSON-RPC over HTTP).
+ureq = "2"
+# RFC3339 parse (+ format, for tests) of the board's last_seen for liveness — no macros.
+time = { version = "0.3", features = ["parsing", "formatting"] }
+# Async runtime + minimal hand-rolled HTTP/1.x for the notifier daemon (task_806: a long-running
+# blocking-accept server scales badly across many fleet hosts, the no-blocking-IO policy's clearest
+# target). Scoped to notify.rs only — every other `fleet` subcommand is a one-shot CLI invocation and
+# stays sync (ureq); this does not make the whole binary async.
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+# sha256 for the memory-sync per-slug content-hash state + the dream-pass exact-dup body identity.
+sha2 = "0.10"

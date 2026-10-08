@@ -1,0 +1,110 @@
+# kb — knowledge-base server configuration (TOML).
+#
+# Every key is OPTIONAL: an omitted key falls back to the built-in default shown below, which matches the
+# Python `kb/config.py` `KB_*` default one-for-one. A host with no config file at all behaves identically to
+# the Python server's defaults. Point the binary at this file with `kb --config <path> serve`.
+#
+# The deployed always-on server (dotfiles `knowledge-base.nix`) runs on CPU; the GPU knobs matter only to the
+# phase-2 ingest workers.
+
+# --- Qdrant ---
+# Base URL of the Qdrant instance holding the collections. (was KB_QDRANT_URL)
+qdrant_url = "http://localhost:6333"
+
+# --- Embeddings ---
+# Embedding model. DO NOT CHANGE from bge-large-en-v1.5 for the live DB: every existing vector is 1024-dim
+# and built with this model; a different model would make all ~29 collections unsearchable. (was KB_EMBED_MODEL)
+embed_model = "BAAI/bge-large-en-v1.5"
+# "cpu" or "gpu". Same model → same vectors either way (switching device needs no re-ingest). (KB_EMBED_DEVICE)
+embed_device = "cpu"
+# Cap the CUDA memory arena in BYTES on GPU so a bulk ingest can't grab all VRAM and starve other GPU users
+# (e.g. the voice assistant's STT). 0 = uncapped. Example: 4294967296 for a 4 GiB cap. (KB_EMBED_GPU_MEM_LIMIT)
+embed_gpu_mem_limit = 0
+# Embed in small batches so one big file can't request a multi-GB allocation. (was KB_EMBED_BATCH)
+embed_batch = 16
+
+# --- Reranking (cross-encoder, always CPU) ---
+# Reorder the top vector candidates by a query↔passage relevance model. (was KB_RERANK)
+rerank_enabled = true
+# Reranker model id. (was KB_RERANK_MODEL)
+rerank_model = "BAAI/bge-reranker-base"
+# How many vector candidates to pull + rerank before blending. (was KB_RERANK_CANDIDATES)
+rerank_candidates = 40
+
+# Where fastembed caches downloaded model files (bge-large + reranker). Empty = fastembed's own default
+# (FASTEMBED_CACHE_DIR env, else .fastembed_cache in the process CWD). fastembed 4.9 uses two different cache
+# mechanisms (the embedder honors HF_HOME, the reranker only reads FASTEMBED_CACHE_DIR/CWD), so a hardened
+# service with a read-only CWD must set ONE explicit writable dir here — it's passed to both. The deployed
+# role points this at its systemd StateDirectory.
+cache_dir = ""
+
+# --- Phase-2 ingest workers (inbox / pipeline) ---
+# These keys are only read by the ingest subcommands (`kb inbox`, and the pipeline worker); the always-on
+# `kb serve` ignores them. Same TOML + `--config` pattern as serve: `kb --config <path> inbox`.
+#
+# Drop-folder the `kb inbox` worker drains. Every file is chunked -> embedded -> upserted -> IPFS-pinned, then
+# DELETED on success (failures move to `<inbox_dir>/_failed/`). The file's FIRST path component under this dir
+# is its collection (sanitized); a file directly in the root goes to `inbox_default_collection`. (KB_INBOX_DIR)
+inbox_dir = "/data/kb-inbox"
+# Collection for a file dropped directly in the inbox root (no subfolder); also the sanitize empty-name
+# fallback. (was KB_INBOX_DEFAULT_COLLECTION)
+inbox_default_collection = "inbox"
+# Kubo (go-ipfs) HTTP RPC base URL the inbox worker pins each ingested file to (add is CIDv1 + pinned). Points
+# at a local node's /api/v0. (was KB_IPFS_API)
+ipfs_url = "http://127.0.0.1:5001"
+# IPFS HTTP gateway base used to build a pinned file's `ipfs_url` payload as `{gateway}/ipfs/{cid}` (citation
+# URL only; not part of the deterministic point id). (was KB_IPFS_GATEWAY) Default is loopback; set this to a
+# LAN-reachable gateway so the stored citation URLs resolve for other agents (e.g. the green deployment uses
+# http://green-machine.lan:8080).
+ipfs_gateway = "http://127.0.0.1:8080"
+# Coordination-board REST base URL for the board-driven pipeline worker (#238). Unused by `kb inbox`. (TB_MCP_URL)
+board_url = "http://127.0.0.1:8079/api"
+# Seconds between periodic catch-up polls for the board-driven workers (uploader/embedder) — a backstop that
+# re-claims any `todo` task assigned to the worker, so a MISSED board->worker webhook delivery still gets
+# processed (e.g. when the board and the worker are NOT co-resident, so the loopback webhook_url the worker
+# registers is unreachable from the board). The poll shares the startup catch-up's claim guard, so it never
+# double-dispatches a task the webhook already took. 0 disables it (pure reactive). Unused by `kb serve`.
+pipeline_poll_secs = 60
+# Host the workers advertise in the webhook_url they register, so the board can POST task events back. Empty =
+# auto-detect the local IP the OS routes toward the board (needed when the board and the worker are NOT
+# co-resident, e.g. board on one host, kb workers on another); set an explicit host/IP to override. Empty +
+# detection-failure falls back to 127.0.0.1 (fine only when co-resident with the board). Paired with
+# pipeline_poll_secs, which is the backstop if a push is ever missed.
+webhook_advertise_host = ""
+
+# --- MCP server ---
+# Bind address for `kb serve`. (was KB_MCP_HOST / KB_MCP_PORT)
+mcp_host = "0.0.0.0"
+mcp_port = 8077
+# rmcp's DNS-rebinding Host allowlist. rmcp defaults to loopback-only; the Python server accepted any Host
+# (LAN agents connect directly), so the default is ["*"] (check disabled). Set an explicit list to restrict.
+mcp_allowed_hosts = ["*"]
+
+# --- Collections ---
+# Collection the CLI + single-collection tool calls default to. (was KB_DEFAULT_COLLECTION)
+default_collection = "voron_manuals"
+# Where kb_remember / kb_supersede write by default. (was KB_MEMORY_COLLECTION)
+memory_collection = "memory"
+# Dedicated collection for dream-promoted shared memories (task_823), kept separate from `memory` so durable
+# cross-agent invariants are curated apart from per-agent memories. Written via the kb_promote MCP tool.
+promoted_collection = "promoted-memory"
+
+# --- Ranking blend ---
+# final = relevance + w_quality*tanh(quality) + w_authority*authority + w_votes*tanh(net_votes/3)
+#         + w_recency*recency   (recency decays only for kind="memory"). (was KB_W_*)
+w_quality = 0.15
+w_authority = 0.10
+w_votes = 0.15
+w_recency = 0.05
+# Memory recency half-life in days. (was KB_RECENCY_HALFLIFE_DAYS)
+recency_halflife_days = 90.0
+
+# Provenance weight in [0,1] by item kind; unknown kinds default to 0.5. (was the AUTHORITY map)
+[authority]
+manual = 1.0
+doc = 0.8
+memory = 0.5
+# Additive non-decaying kinds (recency decays only for kind="memory"): operator tenets and dream-promoted
+# shared memories. tenet = top authority; promoted = high but below tenet.
+tenet = 1.0
+promoted = 0.9
