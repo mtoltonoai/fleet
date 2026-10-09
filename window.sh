@@ -14,14 +14,14 @@ set -uo pipefail
 # recoverable only via absolute /usr/bin/... paths) — a per-invocation tax seen across agents + days
 # (corroborated). The tmux window can inherit a minimal/empty PATH from the launching daemon, and a tool shell
 # that then fails to source a login profile has no usable PATH. APPENDING the standard system + nix-profile bin
-# dirs here (before `exec claude`, so claude and all its child shells inherit it) makes the baseline PATH always
+# dirs here (before `managed Codex launch`, so Codex and all its child shells inherit it) makes the baseline PATH always
 # complete while leaving any existing entries FIRST (a repo-/user-preferred tool still wins); the essentials are
 # guaranteed present as a fallback, so a bare `git`/`curl`/`nix`/coreutil always resolves. A dir that does not
 # exist on this host is harmless (the shell just skips it).
 export PATH="${PATH:+$PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${HOME:-}/.nix-profile/bin:/nix/var/nix/profiles/default/bin"
 
 # task_781 / task_596 / task_782: put the fleet's shared bin dir (next to this script) on PATH before
-# `exec claude`, so a CLI committed in bin/ (paste_create, …) is callable by claude + every Bash-tool shell,
+# `managed Codex launch`, so a CLI committed in bin/ (paste_create, …) is callable by Codex + every Bash-tool shell,
 # and a tool added later is a drop-in with no window.sh edit. CLIs are committed FILES in bin/ (NOT written
 # inline here) — which also keeps deployment-specific/internal values OUT of this public repo: the
 # generic bin/paste_create reads its endpoint + cookie path from a local un-tracked config, never hardcoded.
@@ -74,22 +74,7 @@ following THAT role's gate + land discipline (the role body / your target repo's
 how you gate and land — this launcher does not assume cadenza's pr-sync). Coordinate with peers only via \
 'fleet send'; if you need a human decision send the concierge an 'ask' and keep working — never wait."
 
-KICKOFF="You are the fleet agent named '$AGENT' (role: $ROLE), running UNATTENDED.$VNOTE FIRST read \
-$FLEET_LOOPS/AGENTS-fleet.md (the fleet contract — inbox protocol, the land model, never wait on a human). \
-THEN read $FLEET_LOOPS/$ROLE.md (your role). Your worktree is $WORKTREE. LIST your inbox with 'fleet inbox \
-$AGENT'. Then start your recurring loop by running EXACTLY this (the interval AND a non-empty tick prompt): \
-/loop $INTERVAL $TICK"
-
-# APPROVALS: a fleet agent loops unattended, so a permission prompt would stall it. The operator runs
-# these windows with the approval system OFF (trusted host + repos) — hence --dangerously-skip-permissions.
-# DISALLOW_ASK (all roles except the terminal-interactive `design`) denies the human-question tool so no
-# unattended agent can pop an interactive prompt. Arg order: the variadic --disallowedTools goes FIRST
-# (followed by another flag) so it can't slurp the positional KICKOFF; the prompt lands last.
-CLAUDE_ARGS=()
-if [ "${DISALLOW_ASK:-1}" = "1" ]; then
-  CLAUDE_ARGS+=(--disallowedTools AskUserQuestion)
-fi
-CLAUDE_ARGS+=(--effort "${EFFORT:-high}" --model "$MODEL" --dangerously-skip-permissions)
-
-echo "window.sh: launching '$AGENT' (role=$ROLE model=$MODEL effort=${EFFORT:-high} interval=$INTERVAL) in $WORKTREE"
-exec claude "${CLAUDE_ARGS[@]}" "$KICKOFF"
+# Fleet owns recurrence and wakes; Codex owns managed permissions and tools.
+# The role tick is delivered as an ordinary managed turn, not a Claude /loop command.
+export CDZ_KICKOFF="You are fleet agent '$AGENT' (role: $ROLE). Read $FLEET_LOOPS/AGENTS-fleet.md and $FLEET_LOOPS/$ROLE.md. Your worktree is $WORKTREE. Fleet schedules recurring turns. Do one unit now: $TICK"
+exec fleet codex-session --agent "$AGENT" --model "${MODEL:-default}" --effort "${EFFORT:-high}" --interval "$INTERVAL"

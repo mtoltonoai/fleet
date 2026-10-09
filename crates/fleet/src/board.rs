@@ -207,12 +207,28 @@ impl Board {
         })
     }
 
+    /// Bounded calls for the managed session lifecycle; other callers retain their policy.
+    pub fn connect_timeout(timeout: std::time::Duration) -> Result<Board, String> {
+        Ok(Board {
+            base: Self::base_url(),
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
+        })
+    }
+
     /// Build a client against an explicit base URL (used where the base was resolved by the caller, e.g.
     /// `dream-run --board-api`, so reads and the notify post share one base).
     pub fn with_base(base: &str) -> Board {
         Board {
             base: base.to_string(),
             agent: ureq::agent(),
+        }
+    }
+
+    /// Bounded client for a known board endpoint, including local transport tests.
+    pub fn with_base_timeout(base: &str, timeout: std::time::Duration) -> Board {
+        Board {
+            base: base.to_string(),
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
         }
     }
 
