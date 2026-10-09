@@ -338,11 +338,29 @@ fn board_policy(record: &Value) -> Result<(bool, Option<Duration>), String> {
     Ok((held, interval))
 }
 
+struct BoardUpdate {
+    held: bool,
+    interval: Option<Duration>,
+    effort: Option<String>,
+}
+fn board_effort(record: &Value) -> Result<String, String> {
+    let effort = match record.pointer("/metadata/effort") {
+        None | Some(Value::Null) => "max",
+        Some(Value::String(value)) => value,
+        _ => return Err("invalid Board effort type".into()),
+    };
+    if effort.is_empty() || effort.len() > 32 || !effort.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err("invalid Board effort value".into());
+    }
+    Ok(effort.into())
+}
+
 async fn board_sync(
     base: &str,
     agent: &str,
     status: &str,
-) -> Result<(bool, Option<Duration>), String> {
+    gate: bool,
+) -> Result<BoardUpdate, String> {
     let base = base.to_owned();
     let agent = agent.to_owned();
     let status = status.to_owned();
@@ -350,14 +368,26 @@ async fn board_sync(
         Duration::from_secs(10),
         tokio::task::spawn_blocking(move || {
             let board = crate::board::Board::with_base_timeout(&base, Duration::from_secs(3));
-            let policy = board_policy(&board.get_agent(&agent)?)?;
+            let record = board.get_agent(&agent)?;
+            let policy = board_policy(&record)?;
+            // A changed/invalid effort affects only next-turn admission, never
+            // cancellation of an already running turn during heartbeat refresh.
+            let effort = if gate {
+                Some(board_effort(&record)?)
+            } else {
+                None
+            };
             if !policy.0 {
                 board.post_json(
                     &format!("/agents/{agent}/status"),
                     &json!({"status":status,"status_message":"Fleet Codex session host heartbeat"}),
                 )?;
             }
-            Ok::<_, String>(policy)
+            Ok::<_, String>(BoardUpdate {
+                held: policy.0,
+                interval: policy.1,
+                effort,
+            })
         }),
     )
     .await
@@ -366,7 +396,7 @@ async fn board_sync(
 }
 
 struct BoardJob {
-    task: JoinHandle<Result<(bool, Option<Duration>), String>>,
+    task: JoinHandle<Result<BoardUpdate, String>>,
     gate: bool,
 }
 impl Drop for BoardJob {
@@ -380,7 +410,7 @@ fn start_board_job(options: &HostOptions, status: &str, gate: bool) -> BoardJob 
     let status = status.to_owned();
     BoardJob {
         gate,
-        task: tokio::spawn(async move { board_sync(&base, &agent, &status).await }),
+        task: tokio::spawn(async move { board_sync(&base, &agent, &status, gate).await }),
     }
 }
 
@@ -443,6 +473,7 @@ async fn host(options: HostOptions, mut shutdown: watch::Receiver<bool>) -> Resu
     let mut active: Option<Active> = None;
     let mut board_job: Option<BoardJob> = None;
     let mut board_ready = false;
+    let mut current_effort = options.effort.clone();
     let mut next_tick = Instant::now() + options.cadence;
     let mut current_cadence = options.cadence;
     let mut next_board = Instant::now() + Duration::from_secs(60);
@@ -491,7 +522,7 @@ async fn host(options: HostOptions, mut shutdown: watch::Receiver<bool>) -> Resu
                             cwd: options.cwd.clone(),
                             prompt,
                             model: options.model.clone(),
-                            effort: options.effort.clone(),
+                            effort: current_effort.clone(),
                             resume_thread: state.thread_id.clone(),
                             timeout: Duration::from_secs(1800),
                             event_log: attempt.join("events.jsonl"),
@@ -599,7 +630,10 @@ async fn host(options: HostOptions, mut shutdown: watch::Receiver<bool>) -> Resu
                 let job=board_job.take().unwrap();
                 let result=result.map_err(|e|e.to_string()).and_then(|result|result);
                 match result {
-                    Ok((false, interval)) => {
+                    Ok(BoardUpdate {held:false,interval,effort}) => {
+                        // Existing work already owns its RunOptions. This updates
+                        // only future admission, including the next gate-bound turn.
+                        if let Some(effort)=effort {current_effort=Some(effort);}
                         if let Some(interval)=interval {
                             if current_cadence!=interval && active.is_none() {next_tick=Instant::now()+interval;}
                             current_cadence=interval;
@@ -1106,5 +1140,115 @@ for line in sys.stdin:
             serde_json::from_slice(&std::fs::read(root.join("tester/state.json")).unwrap())
                 .unwrap();
         assert!(state.accepted_event_ids.contains(&"board:42:tester".into()));
+    }
+    #[tokio::test]
+    async fn board_effort_refresh_applies_next_turn_without_interrupt_or_thread_change() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tokio::io::AsyncReadExt;
+        let (temp, mut options) = mock_host("completed");
+        options.board_native = true;
+        options.effort = Some("low".into());
+        options.model = Some("gpt-6-astra".into());
+        let script=std::fs::read_to_string(&options.executable).unwrap().replace("elif method=='turn/start':", "elif method=='turn/start':\n  if m['params'].get('effort')=='medium':\n   import time\n   open('first-turn-started','w').close()\n   while not os.path.exists('release-first'): time.sleep(0.01)");
+        std::fs::write(&options.executable, script).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        options.board_base = format!("http://{}", listener.local_addr().unwrap());
+        let desired_max = Arc::new(AtomicBool::new(false));
+        let flag = desired_max.clone();
+        let (server_stop, mut server_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            loop {
+                let incoming = tokio::select! {v=listener.accept()=>v, _=&mut server_rx=>break};
+                let (stream, _) = incoming.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut first = String::new();
+                reader.read_line(&mut first).await.unwrap();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length: ") {
+                        length = v.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).await.unwrap();
+                let response=if first.starts_with("GET "){json!({"id":"tester","lifecycle_intent":"run","metadata":{"effort":if flag.load(Ordering::SeqCst){"max"}else{"medium"}}})}else{json!({})}.to_string();
+                reader
+                    .get_mut()
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let root = options.root.clone();
+        let (stop, rx) = watch::channel(false);
+        let host_task = tokio::spawn(host(options, rx));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !temp.path().join("first-turn-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        desired_max.store(true, Ordering::SeqCst);
+        assert_eq!(
+            control(
+                &root,
+                json!({"prompt":"next ordinary turn","event_id":"effort-max"})
+            )
+            .await["ok"],
+            true
+        );
+        std::fs::write(temp.path().join("release-first"), b"continue").unwrap();
+        let requests = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let text = std::fs::read_to_string(temp.path().join("requests.jsonl")).unwrap();
+                let values: Vec<Value> = text
+                    .lines()
+                    .filter_map(|l| serde_json::from_str(l).ok())
+                    .collect();
+                if values
+                    .iter()
+                    .filter(|v| v["method"] == "turn/start")
+                    .count()
+                    == 2
+                {
+                    break values;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let done = wait_state(&root, "idle").await;
+        assert_eq!(done.thread_id.as_deref(), Some("thread-host"));
+        let efforts: Vec<_> = requests
+            .iter()
+            .filter(|v| v["method"] == "turn/start")
+            .map(|v| v["params"]["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(efforts, vec!["medium", "max"]);
+        assert!(!requests.iter().any(|v| v["method"] == "turn/interrupt"));
+        assert!(requests.iter().any(|v|v["method"]=="thread/resume" && v["params"]["threadId"]=="thread-host"));
+        stop.send(true).unwrap();
+        host_task.await.unwrap().unwrap();
+        server_stop.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(board_effort(&json!({})).unwrap(), "max");
+        assert!(board_effort(&json!({"metadata":{"effort":42}})).is_err());
     }
 }

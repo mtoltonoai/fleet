@@ -666,7 +666,7 @@ fn default_true() -> bool {
     true
 }
 fn default_effort() -> String {
-    "high".to_string()
+    "max".to_string()
 }
 fn default_interval() -> String {
     "10m".to_string()
@@ -3344,7 +3344,7 @@ enum Cmd {
         agent: String,
         #[arg(long, default_value = "default")]
         model: String,
-        #[arg(long, default_value = "high")]
+        #[arg(long, default_value = "max")]
         effort: String,
         #[arg(long, default_value = "30m")]
         interval: String,
@@ -5418,7 +5418,7 @@ fn spin_up(agent: &str, apply: bool, ignore_intent: bool) {
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     let model = resolve_model(&field("model").unwrap_or_else(|| "default".into()));
-    let effort = field("effort").unwrap_or_else(|| "high".into());
+    let effort = field("effort").unwrap_or_else(default_effort);
     let interval = field("interval").unwrap_or_else(|| "30m".into());
     // The agent runtime to launch (metadata.harness); defaults to claude so existing records are unchanged.
     let harness = field("harness").unwrap_or_else(|| "codex".into());
@@ -21052,7 +21052,7 @@ value = \"/repo/.claude/worktrees/dead/target\"
         assert_eq!(cfg.agents[0].interval, "10m");
         assert_eq!(cfg.agents[0].model, "default");
         assert_eq!(cfg.agents[1].model, "fable");
-        assert_eq!(cfg.agents[1].effort, "high", "default effort");
+        assert_eq!(cfg.agents[1].effort, "max", "default effort");
     }
 
     #[test]
